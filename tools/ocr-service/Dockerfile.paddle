@@ -1,0 +1,48 @@
+# 真 PaddleOCR 服务（hubserving 形状）—— 全量变体。
+#
+# 不用官方 deploy/docker/hubserving/cpu/Dockerfile 的原因：那份是 2.0 模板，
+# 里面 `git clone https://github.com/PaddlePaddle/PaddleOCR.git` 与 {link}/{file}
+# 占位符在本机（GitHub 不通）都过不去；而 paddlehub 2.4 的版本锁链
+# （numpy 1.26.4 / protobuf 3.20.3 / huggingface_hub 0.25.2）只为一个接口不值得。
+#
+# 基础镜像来自百度镜像仓（本机实测可达），pypi 走清华源（百度源 403）。
+# ⚠️ 成品 8.38 GB（基础层解压后 6.47 GB）——绝大多数场景请用 Dockerfile.paddle-slim。
+FROM registry.baidubce.com/paddlepaddle/paddle:2.6.2
+
+# 1) 先装 paddleocr。它会带进 numpy 2.x 与 opencv-python-headless 5.x
+RUN pip install --no-cache-dir "paddleocr==2.7.5" "flask==3.0.3" \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 2) 把两处踩过的坑钉死：
+#    - numpy 2.x 会让 opencv 4.6（按 numpy 1.x ABI 编译）import 直接崩
+#      （报 `numpy.core.multiarray failed to import`）；
+#    - headless 5.x 把 cv2 覆盖成要求 numpy>=2 的版本 —— 必须先卸掉它，
+#      再用 --no-deps 装回 4.6.0.66，否则依赖解析会又把 numpy 升回去。
+RUN pip uninstall -y opencv-python-headless opencv-contrib-python-headless || true
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
+        "numpy==1.26.4" "opencv-python==4.6.0.66" "opencv-contrib-python==4.6.0.66" \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 3) paddleocr 2.7.5 官方 bug：paddleocr.py 用了 predict_system 却没 import
+#    （第 575 行 `class PaddleOCR(predict_system.TextSystem)`），导入即 NameError。
+#    site-packages 与 dist-packages 两种布局都兼容，patch 不到就直接构建失败而不是带病出厂。
+RUN python -c "import os; \
+c=['/usr/local/lib/python3.10/site-packages/paddleocr/paddleocr.py', \
+   '/usr/local/lib/python3.10/dist-packages/paddleocr/paddleocr.py']; \
+p=next((x for x in c if os.path.exists(x)), None); \
+assert p, '找不到 paddleocr.py'; \
+s=open(p).read(); \
+old='from tools.infer.utility import draw_ocr, str2bool, check_gpu'; \
+assert old in s, 'paddleocr.py 结构变了，请重新确认补丁位置'; \
+open(p,'w').write(s.replace(old, old+'\nfrom tools.infer import predict_system', 1)); \
+print('patched', p)"
+
+WORKDIR /app
+COPY paddle_server.py /app/paddle_server.py
+
+EXPOSE 8868
+# 首次识别会下载 PP-OCR 中文模型到 /root/.paddleocr（约 20MB），之后离线可用。
+# 模型版本默认 PP-OCRv3：v4 检测模型在 paddle 2.6.2 上会于 SelfAttentionFusePass
+# 触发 SIGILL（enable_mkldnn / FLAGS_use_mkldnn / FLAGS_enable_pir_api / 绑核均无效），
+# 见 paddle_server.py 里的说明。
+CMD ["python", "/app/paddle_server.py"]

@@ -1,0 +1,119 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: healthos-java-postgres
+    environment:
+      POSTGRES_DB: healthos
+      POSTGRES_USER: healthos
+      POSTGRES_PASSWORD: healthos
+    ports:
+      - "55433:5432"
+    volumes:
+      - healthos-java-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U healthos -d healthos"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # 图数据库。只有 healthos.graph.store=neo4j|dual 时才需要
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: healthos-java-neo4j
+    profiles: ["graph"]
+    environment:
+      NEO4J_AUTH: neo4j/healthos123
+      NEO4J_server_memory_pagecache_size: 256M
+      NEO4J_server_memory_heap_max__size: 512M
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - healthos-java-neo4jdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # 真实可运行的 OCR 服务（Tesseract + 中文语言包）。只有 healthos.ocr.provider=generic 时才需要
+  ocr:
+    build:
+      context: ./tools/ocr-service
+    image: healthos-ocr:local
+    container_name: healthos-java-ocr
+    profiles: ["ocr"]
+    ports:
+      - "8868:8868"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8868/health').read()\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # 真 PaddleOCR（hubserving 形状）。healthos.ocr.provider=paddle + protocol=paddle 时使用。
+  # 刻意不加 healthcheck：PaddleHub Serving 没有 /health 路由，挂了探针也探不出来。
+  # 与上面的 ocr 服务占同一端口，两者二选一，不要同时起。
+  ocr-paddle:
+    build:
+      context: ./tools/ocr-service
+      # slim：2.97 GB / 常驻 484 MiB，与全量版输出逐字一致（模型 md5 相同），
+      # 所以默认用它。Dockerfile.paddle 是 8.38 GB 的兜底，只在 slim 构建不出来时用。
+      dockerfile: Dockerfile.paddle-slim
+    image: healthos-ocr-paddle:slim
+    container_name: healthos-java-ocr-paddle
+    profiles: ["ocr-paddle"]
+    ports:
+      - "8868:8868"
+
+  # RAGFlow HTTP API 契约服务。生产请改为指向真实 RAGFlow 实例
+  ragflow:
+    build:
+      context: ./tools/ragflow-stub
+    image: healthos-ragflow-stub:local
+    container_name: healthos-java-ragflow
+    profiles: ["ragflow"]
+    environment:
+      RAGFLOW_API_KEY: ragflow-local-test-key
+    ports:
+      - "9380:9380"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:9380/health').read()\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: healthos-java-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      HEALTHOS_DB_URL: jdbc:postgresql://postgres:5432/healthos
+      HEALTHOS_DB_USER: healthos
+      HEALTHOS_DB_PASSWORD: healthos
+      HEALTHOS_AUTH_USER: admin
+      HEALTHOS_AUTH_PASSWORD: admin123
+      HEALTHOS_SESSION_SECRET: local-docker-session-secret
+      HEALTHOS_AI_PROVIDER: template
+      # 启用外部依赖时把下面几项打开（需同时 --profile graph --profile ocr --profile ragflow）
+      HEALTHOS_GRAPH_STORE: ${HEALTHOS_GRAPH_STORE:-jdbc}
+      HEALTHOS_NEO4J_URI: ${HEALTHOS_NEO4J_URI:-bolt://neo4j:7687}
+      HEALTHOS_NEO4J_PASSWORD: ${HEALTHOS_NEO4J_PASSWORD:-}
+      HEALTHOS_RETRIEVAL_PROVIDER: ${HEALTHOS_RETRIEVAL_PROVIDER:-local}
+      HEALTHOS_RAGFLOW_BASE_URL: ${HEALTHOS_RAGFLOW_BASE_URL:-http://ragflow:9380}
+      HEALTHOS_RAGFLOW_API_KEY: ${HEALTHOS_RAGFLOW_API_KEY:-ragflow-local-test-key}
+      HEALTHOS_OCR_PROVIDER: ${HEALTHOS_OCR_PROVIDER:-none}
+      HEALTHOS_OCR_BASE_URL: ${HEALTHOS_OCR_BASE_URL:-http://ocr:8868}
+    ports:
+      - "18100:18100"
+    volumes:
+      - healthos-java-objects:/app/.local/objects
+
+volumes:
+  healthos-java-pgdata:
+  healthos-java-neo4jdata:
+  healthos-java-objects:

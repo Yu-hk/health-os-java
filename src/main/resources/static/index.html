@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Health-OS 工作台</title>
+  <link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+  <!-- 登录遮罩 -->
+  <div id="login-screen" class="login-screen hidden">
+    <div class="login-card">
+      <div class="login-brand">
+        <div class="login-logo">H</div>
+        <div>
+          <div class="login-title">Health-OS 工作台</div>
+          <div class="login-sub">医疗 AI 平台 · 控制台</div>
+        </div>
+      </div>
+      <form id="login-form" class="login-form">
+        <label>用户名</label>
+        <input id="login-username" type="text" autocomplete="username" value="admin" />
+        <label>口令</label>
+        <input id="login-password" type="password" autocomplete="current-password" value="admin123" />
+        <button type="submit" id="login-btn">登录</button>
+        <div id="login-error" class="login-error hidden"></div>
+      </form>
+      <div class="login-hint">默认演示账号 admin / admin123（可在 application.yml 修改）</div>
+    </div>
+  </div>
+
+  <!-- 主框架 -->
+  <div id="app-shell" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="sidebar-logo">H</div>
+        <span>Health-OS</span>
+      </div>
+      <nav id="sidebar-nav" class="sidebar-nav"></nav>
+      <div class="sidebar-foot">
+        <div id="current-user" class="current-user"></div>
+        <button id="logout-btn" class="btn-ghost">退出登录</button>
+      </div>
+    </aside>
+    <main class="content">
+      <header class="content-head">
+        <div id="breadcrumb" class="breadcrumb"></div>
+        <div id="head-actions" class="head-actions"></div>
+      </header>
+      <section id="page" class="page"></section>
+    </main>
+  </div>
+
+  <div id="toast-host" class="toast-host"></div>
+  <div id="modal-host" class="modal-host hidden"></div>
+
+  <script src="/assets/api.js"></script>
+  <script src="/assets/ui.js"></script>
+  <script src="/assets/router.js"></script>
+  <script src="/assets/pages/dashboard.js"></script>
+  <script src="/assets/pages/patients.js"></script>
+  <script src="/assets/pages/intake.js"></script>
+  <script src="/assets/pages/care.js"></script>
+  <script src="/assets/pages/classics.js"></script>
+  <script src="/assets/pages/qa.js"></script>
+  <script src="/assets/pages/memory.js"></script>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

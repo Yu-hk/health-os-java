@@ -1,0 +1,278 @@
+server:
+  port: 18100
+  shutdown: graceful
+
+spring:
+  application:
+    name: health-os-java
+  datasource:
+    url: ${HEALTHOS_DB_URL:jdbc:postgresql://127.0.0.1:55433/healthos}
+    username: ${HEALTHOS_DB_USER:healthos}
+    password: ${HEALTHOS_DB_PASSWORD:healthos}
+    hikari:
+      pool-name: healthos-pool
+      maximum-pool-size: 8
+      minimum-idle: 2
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
+  servlet:
+    multipart:
+      max-file-size: 200MB
+      max-request-size: 200MB
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+    db-config:
+      id-type: input
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+  health:
+    redis:
+      enabled: false
+    # Neo4j 只在 healthos.graph.store=neo4j|dual 时才是依赖。默认 jdbc 部署下这个指示器
+    # 仍会去连 bolt://localhost:7687，连不上就把整体报成 DOWN —— 一个不存在的依赖
+    # 把健康检查拉红，比没有健康检查更糟（探针会杀掉一个完全正常的实例）。
+    # 用 neo4j/dual 部署时把 HEALTHOS_GRAPH_NEO4J_HEALTH 设成 true，图库掉线才会被看见。
+    neo4j:
+      enabled: ${HEALTHOS_GRAPH_NEO4J_HEALTH:false}
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+  api-docs:
+    path: /v3/api-docs
+
+healthos:
+  environment: local
+  auth:
+    username: ${HEALTHOS_AUTH_USER:admin}
+    password: ${HEALTHOS_AUTH_PASSWORD:admin123}
+    # 会话密钥：HMAC-SHA256 的密钥。非 local 环境要求 ≥32 字节，否则拒绝启动。
+    # 生成：openssl rand -base64 48
+    session-secret: ${HEALTHOS_SESSION_SECRET:local-dev-only-change-me}
+    session-ttl: 8h
+    cookie-name: healthos_java_session
+    # Cookie 的 Secure 标记：本地 http 必须 false（否则浏览器丢弃 Cookie，表现为"登录成功但立刻未登录"），
+    # 走 HTTPS 的部署必须置 true。
+    cookie-secure: ${HEALTHOS_COOKIE_SECURE:false}
+    # 登录失败锁定：同一账号连续失败 N 次后锁定 lock-duration。
+    # 5 次 / 15 分钟把爆库速度压到每分钟 0.33 次以内。
+    max-login-attempts: 5
+    lock-duration: 15m
+    # 多账号（可选）。配了 users 就以列表为准，没配仍用上面的单账号。
+    # 患者域按归属人隔离，第二个账号一出现，漏掉 owner 条件就等于越权读。
+    # 非 local 环境下口令必须是哈希：java -cp target/classes \
+    #   com.kangheng.healthos.service.auth.PasswordHash '<口令>'
+    users: []
+  storage:
+    type: local
+    root: ./.local/objects
+  ai:
+    provider: ${HEALTHOS_AI_PROVIDER:template}
+    base-url: ${HEALTHOS_AI_BASE_URL:https://api.deepseek.com}
+    api-key: ${HEALTHOS_AI_API_KEY:}
+    model: ${HEALTHOS_AI_MODEL:deepseek-v4-pro}
+    timeout: 180s
+  # 模型成本与配额。单价单位「货币 / 百万 token」，落库用微元，于是 cost_micros = tokens × 单价。
+  # 配额按主线（pipelineKey）统计，0 = 不限；没配单价的模型照样记账但 cost 留空（不猜）。
+  # 下面是 DeepSeek 官方价（api-docs.deepseek.com/quick_start/pricing，USD/百万 token，**非高峰价**）。
+  model-usage:
+    enabled: ${HEALTHOS_MODEL_USAGE_ENABLED:true}
+    currency: USD
+    daily-token-quota: ${HEALTHOS_MODEL_USAGE_DAILY_TOKENS:0}
+    daily-cost-quota-micros: ${HEALTHOS_MODEL_USAGE_DAILY_COST_MICROS:0}
+    # 官方峰谷价差 2 倍；高峰时段按 UTC 写，仅周一至周五生效（法定节假日不建模，那天按峰值估价属保守高估）
+    peak-multiplier: ${HEALTHOS_MODEL_USAGE_PEAK_MULTIPLIER:2.0}
+    peak-windows-utc:
+      - "01:00-04:00"
+      - "06:00-10:00"
+    prices:
+      deepseek-flash:
+        cache-hit-input-per-million: 0.003
+        cache-miss-input-per-million: 0.15
+        output-per-million: 0.6
+      deepseek-v4-pro:
+        cache-hit-input-per-million: 0.022
+        cache-miss-input-per-million: 0.66
+        output-per-million: 1.98
+      # 旧模型名（官方已下架，请求由 Flash 承接并按 Flash 计费），保留以免历史配置变成"无单价"
+      deepseek-v4-flash:
+        cache-hit-input-per-million: 0.003
+        cache-miss-input-per-million: 0.15
+        output-per-million: 0.6
+  # 向量化（本地检索用的 embedding）。provider=none 时退回纯词面打分，其余链路不变。
+  # 默认指向本机 Ollama 的 bge-m3（1024 维）；Ollama 没起也不会导致服务起不来，只会降级并留痕。
+  embedding:
+    provider: ${HEALTHOS_EMBEDDING_PROVIDER:ollama}
+    base-url: ${HEALTHOS_EMBEDDING_BASE_URL:http://127.0.0.1:11434}
+    model: ${HEALTHOS_EMBEDDING_MODEL:bge-m3}
+    # 换模型必须同步改这里，否则每次响应都会因维度不符而报错（比"能跑但分数全噪声"好查）
+    dimension: ${HEALTHOS_EMBEDDING_DIM:1024}
+    batch-size: 16
+    timeout: 30s
+    keep-alive: 30m
+  extraction:
+    chunk-chars: 1500
+    chunk-overlap: 150
+    max-entities-per-segment: 25
+    max-relations-per-segment: 40
+    split-min-chars: 400
+    max-split-depth: 3
+    segment-max-attempts: 2
+    retry-base: 2s
+    retry-max: 15s
+    retry-jitter-ratio: 0.25
+    min-confidence: 0.55
+  pipeline:
+    dispatcher-enabled: true
+    dispatcher-interval-ms: 2000
+    dispatcher-batch-size: 5
+    outbox-max-attempts: 3
+  retrieval:
+    # local（本地切片）/ ragflow（外部知识库）/ hybrid（双写 + 检索降级）
+    provider: ${HEALTHOS_RETRIEVAL_PROVIDER:local}
+    chunk-chars: 200
+    chunk-overlap: 20
+    candidate-limit: 200
+    top-k: 5
+    # 词面与向量的融合权重：0.6 表示向量占六成；纯向量召回的准入门槛 0.45（余弦）
+    vector-weight: ${HEALTHOS_RETRIEVAL_VECTOR_WEIGHT:0.6}
+    vector-min-score: ${HEALTHOS_RETRIEVAL_VECTOR_MIN_SCORE:0.45}
+    ragflow:
+      base-url: ${HEALTHOS_RAGFLOW_BASE_URL:http://127.0.0.1:9380}
+      api-key: ${HEALTHOS_RAGFLOW_API_KEY:}
+      dataset-prefix: ${HEALTHOS_RAGFLOW_DATASET_PREFIX:healthos-}
+      parser-id: ${HEALTHOS_RAGFLOW_PARSER_ID:naive}
+      parse-type: 1
+      embedding-model: ${HEALTHOS_RAGFLOW_EMBEDDING_MODEL:}
+      timeout: 120s
+      parse-timeout: 180s
+      parse-poll-interval: 2s
+      # 以下三项对齐原工程 qa_ragflow_preset 的 Chat 检索配置
+      similarity-threshold: ${HEALTHOS_RAGFLOW_SIMILARITY_THRESHOLD:0.2}
+      keywords-similarity-weight: ${HEALTHOS_RAGFLOW_KEYWORDS_SIMILARITY_WEIGHT:0.3}
+      rerank-id: ${HEALTHOS_RAGFLOW_RERANK_ID:}
+      page-size: 30
+  qa:
+    # single（单路原文证据，默认）/ parallel（原文 + 图谱 + 指标 三路并行后汇总）
+    mode: ${HEALTHOS_QA_MODE:single}
+    branch-timeout: ${HEALTHOS_QA_BRANCH_TIMEOUT:20s}
+  # Agent Lab 的 MCP 传输层。
+  # in-process：在同一个 JVM 里枚举工具目录并查库（默认，零依赖）；
+  # stdio：用 node 拉起 tools/mcp-server/patient-business.js，走一行一条 JSON 的 JSON-RPC。
+  #   工具数据仍由本进程按登录态读出——子进程只做协议适配，拿不到数据库凭据。
+  agent-lab:
+    transport: ${HEALTHOS_AGENT_LAB_TRANSPORT:in-process}
+    node-command: ${HEALTHOS_AGENT_LAB_NODE:node}
+    server-script: ${HEALTHOS_AGENT_LAB_SCRIPT:tools/mcp-server/patient-business.js}
+    # 内部只读端点：只监听回环。子进程把 tools/call 转发到这里。
+    tool-endpoint: ${HEALTHOS_AGENT_LAB_TOOL_ENDPOINT:http://127.0.0.1:18100/internal/agent-lab/tools}
+    # 留空即由启动时随机生成（本次进程专用，不落配置文件）。配了就用配置值。
+    internal-token: ${HEALTHOS_AGENT_LAB_INTERNAL_TOKEN:}
+    timeout: 20s
+  ocr:
+    # none（未接入，遇到扫描件明确失败）/ paddle / generic
+    provider: ${HEALTHOS_OCR_PROVIDER:none}
+    # 留空即跟随 provider（推荐）。接口路径由 provider 决定：
+    # paddle → POST /predict/ocr_system（PaddleHub Serving），generic → POST /ocr。
+    # 显式写成与 provider 不一致的值会**启动失败**，避免"配了 paddle 却在打 /ocr"。
+    protocol: ${HEALTHOS_OCR_PROTOCOL:}
+    # 只给到主机和端口（如 http://127.0.0.1:8868）。带路径会拼成重复路径 → 404，
+    # 而 404 属于"不可重试"，表现为"一上传就失败"。
+    base-url: ${HEALTHOS_OCR_BASE_URL:}
+    api-key: ${HEALTHOS_OCR_API_KEY:}
+    language: ${HEALTHOS_OCR_LANGUAGE:chi_sim}
+    timeout: 180s
+    dpi: 200
+    min-confidence: 0.45
+    max-pages: 200
+    # PDF 文本层有效字符低于该值即判定为扫描件，转 OCR
+    text-layer-min-chars: 20
+  graph:
+    # jdbc（PostgreSQL 表）/ neo4j / dual（双写，读走 Neo4j 并回落）
+    store: ${HEALTHOS_GRAPH_STORE:jdbc}
+    neo4j:
+      uri: ${HEALTHOS_NEO4J_URI:bolt://127.0.0.1:7687}
+      username: ${HEALTHOS_NEO4J_USER:neo4j}
+      password: ${HEALTHOS_NEO4J_PASSWORD:}
+      database: ${HEALTHOS_NEO4J_DATABASE:neo4j}
+      connection-timeout: 5s
+      default-depth: 1
+      max-depth: 4
+  tracing:
+    # 关掉即整条观测链路退化为空操作，业务零影响
+    enabled: ${HEALTHOS_TRACING_ENABLED:true}
+    # async（单写线程，不阻塞业务）/ direct（同步写，便于测试）
+    writer: ${HEALTHOS_TRACING_WRITER:async}
+    queue-capacity: 10000
+    retention-days: ${HEALTHOS_TRACING_RETENTION_DAYS:14}
+    max-spans-per-trace: 500
+    sweep-batch-size: 200
+    sweep-max-batches: 50
+    retention-cron: "0 30 3 * * *"
+    overview-max-rows: 5000
+  patient:
+    object-prefix: patients
+    max-object-bytes: 20971520
+    max-batch-rows: 5000
+
+  # 照护文档（客户健康评估报告 / 四周执行计划）。
+  # 可签发账号白名单本身不在这里配：默认 [admin, doctor]，空列表表示"谁都不能签"。
+  care:
+    # PDF 导出：中文必须内嵌字体。PDFBox 没有内置 CJK 字体，
+    # reportlab 的 STSong-Light 是字体名引用而非嵌入，照搬会在客户机上看方块。
+    # font-path 留空则按常见系统路径探测（msyh.ttc / wqy-microhei.ttc / NotoSansCJK-Regular.ttc 等）；
+    # 探测不到不会启动失败，但 /health/dependencies 的 carePdf 显示 unavailable，
+    # 导出接口返回 503 CARE_PDF_UNAVAILABLE——宁可明说，也不出一份没字的 PDF。
+    pdf:
+      enabled: ${HEALTHOS_CARE_PDF_ENABLED:true}
+      font-path: ${HEALTHOS_CARE_PDF_FONT_PATH:}
+
+  # 访问控制白名单。
+  # 患者域数据一律按归属人隔离（管理员也不例外），只有下面两类是显式例外：
+  #   admin-users        运维接口（孤儿扫描/清理、观测保留策略清理）
+  #   trace-global-users 轨迹全局读（轨迹里含问答原文与患者 ID）
+  security:
+    admin-users:
+      - ${HEALTHOS_ADMIN_USERS:admin}
+    trace-global-users:
+      - ${HEALTHOS_TRACE_GLOBAL_USERS:admin}
+    # 模型配置中心管理白名单。与运维白名单分开：改路由是全系统生效的动作。
+    model-admin-users:
+      - ${HEALTHOS_MODEL_ADMIN_USERS:admin}
+  # 模型配置中心：每条业务主线各配各的模型、参数与密钥。
+  # 默认关闭。启用必须给 master-key——它用于加密模型密钥（AES-GCM）与计算配置指纹（HMAC）。
+  model-routing:
+    enabled: ${HEALTHOS_MODEL_ROUTING_ENABLED:false}
+    master-key: ${HEALTHOS_MODEL_ROUTING_MASTER_KEY:}
+    # 服务端代理。留空表示不支持 system_proxy 连接模式。
+    system-proxy: ${HEALTHOS_MODEL_ROUTING_PROXY:}
+    # 迁移基线：与它一致且协议为 chat 的配置视为"一直在用"，免能力探测。
+    baseline-provider-id: qwen
+    baseline-model: ${HEALTHOS_MODEL_ROUTING_BASELINE_MODEL:qwen-max}
+    baseline-base-url: ${HEALTHOS_MODEL_ROUTING_BASELINE_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
+    baseline-protocol: chat
+    provider-timeout-seconds: 120
+    structured-output-max-tokens: 8000
+
+logging:
+  level:
+    com.kangheng.healthos: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"

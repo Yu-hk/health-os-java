@@ -1,0 +1,27 @@
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# 本地运行数据：对象存储、日志、cookie、测试产物
+.local/
+logs/
+*.log
+
+# 图表生成工具（archify）的中间产物，图形本身已落到 docs/
+.archify/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 私密配置
+.env
+.env.local
+.secrets/

@@ -1,0 +1,50 @@
+# 真 PaddleOCR 服务（hubserving 形状）—— slim 变体。
+#
+# 相比 Dockerfile.paddle（基于百度官方 paddle:2.6.2 镜像）的区别只有基础镜像：
+# 官方镜像解压后 6.47GB（成品镜像 8.38GB），而这里从 python:3.10-slim 起装
+# pip 的 paddlepaddle wheel，成品实测 2.97GB。
+#
+# 输出与全量版**逐字一致**（已核对 v3 检测/识别模型的 md5 相同），
+# 热态 400–550ms/页，常驻 484MiB（全量版 662MiB）。所以 compose 默认用这个。
+#
+# 拉不到 Docker Hub 时用 daocloud 镜像源（本机实测可达；registry-1.docker.io 不通）。
+FROM docker.m.daocloud.io/library/python:3.10-slim
+
+# libgomp1: paddle 的 OpenMP 运行时；libgl1/libglib2.0-0: opencv 的动态依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 1) 先装 paddle 运行时
+RUN pip install --no-cache-dir "paddlepaddle==2.6.2" \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 2) 再装 paddleocr。它会带进 numpy 2.x 与 opencv-python-headless 5.x
+RUN pip install --no-cache-dir "paddleocr==2.7.5" "flask==3.0.3" \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 3) 把两处踩过的坑钉死：
+#    - numpy 2.x 会让 opencv 4.6（按 numpy 1.x ABI 编译）import 直接崩，
+#      且 headless 5.x 把 cv2 覆盖成一个要求 numpy>=2 的版本 —— 先卸掉它；
+#    - opencv 必须回到 4.6.0.66 并加 --no-deps，否则又被依赖解析升回去。
+RUN pip uninstall -y opencv-python-headless opencv-contrib-python-headless || true
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
+        "numpy==1.26.4" "opencv-python==4.6.0.66" "opencv-contrib-python==4.6.0.66" \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 4) paddleocr 2.7.5 官方 bug：paddleocr.py 里用了 predict_system 却没 import
+#    （第 575 行 class PaddleOCR(predict_system.TextSystem)），导入即 NameError。
+RUN python -c "p='/usr/local/lib/python3.10/site-packages/paddleocr/paddleocr.py'; \
+import os; \
+p = p if os.path.exists(p) else '/usr/local/lib/python3.10/dist-packages/paddleocr/paddleocr.py'; \
+s=open(p).read(); \
+old='from tools.infer.utility import draw_ocr, str2bool, check_gpu'; \
+assert old in s, 'paddleocr.py 结构变了，请重新确认补丁位置'; \
+open(p,'w').write(s.replace(old, old+'\nfrom tools.infer import predict_system', 1)); \
+print('patched', p)"
+
+WORKDIR /app
+COPY paddle_server.py /app/paddle_server.py
+
+EXPOSE 8868
+CMD ["python", "/app/paddle_server.py"]
