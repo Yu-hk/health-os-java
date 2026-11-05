@@ -1233,3 +1233,36 @@ CREATE TABLE IF NOT EXISTS model_usage (
 ALTER TABLE model_usage ADD COLUMN IF NOT EXISTS cached_prompt_tokens INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_model_usage_created ON model_usage (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_model_usage_scope ON model_usage (scope_key, created_at DESC);
+
+-- ============================================================================
+-- 会话吊销名单与登录失败计数（落库版）。
+--
+-- 为什么原本放在进程内存里、现在又要挪到库里：无状态令牌"发出去就收不回"，
+-- 登出必须有一份名单；而名单只在内存里的话，重启即清空（登出形同没登出）、
+-- 多实例各存一份（在 A 登出后拿同一张 Cookie 打 B 照样进得去）。
+-- 这两件事都不是"可接受的单机取舍"，而是安全问题——所以默认走库。
+--
+-- 表很小、查询都走主键，单次约 0.1ms；内存里仍留一份做 DB 不可用时的降级，
+-- 降级会打 warn（红线：降级要留痕，不许静默成功）。
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS auth_session_revocation (
+    session_id VARCHAR(64)  PRIMARY KEY,
+    subject    VARCHAR(120),
+    expires_at TIMESTAMPTZ  NOT NULL,
+    revoked_at TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+-- 清理任务按到期时间扫，没有索引会全表扫
+CREATE INDEX IF NOT EXISTS idx_auth_revocation_expires
+    ON auth_session_revocation (expires_at);
+
+-- 一行 = 一个账号的当前失败状态，主键是 normalize 后的小写用户名（与内存实现同一个 key）
+CREATE TABLE IF NOT EXISTS auth_login_attempt (
+    username_key VARCHAR(120) PRIMARY KEY,
+    fail_count   INTEGER      NOT NULL DEFAULT 0,
+    window_start TIMESTAMPTZ  NOT NULL,
+    locked_until TIMESTAMPTZ,
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_auth_login_attempt_locked
+    ON auth_login_attempt (locked_until);

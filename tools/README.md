@@ -9,13 +9,14 @@
 | `mcp-server/` | **真的** MCP Server（零依赖 Node，stdio 上的 JSON-RPC 2.0）。`--healthos.agent-lab.transport=stdio` 时由 Java 用 `ProcessBuilder` 拉起 | —（stdin/stdout） | 不用手动起，见 `docs/extending/EXTENDING.md` §8.103 |
 | `smoke/llm_stub.py` | OpenAI 兼容桩：只回固定答案 + 固定 `usage`，用来在没有有效上游密钥时验证"用量记账 → 成本 → 配额闸门"这条链路 | 18999 | `python tools/smoke/llm_stub.py 18999 880 42` |
 
-三个**校验脚本**：`check-layering.py` 只依赖本机代码；两个 `smoke/` 脚本对着跑着的应用打真实请求。
+三个**校验脚本**：`check-layering.py` 只依赖本机代码；三个 `smoke/` 脚本对着跑着的应用打真实请求。
 
 | 脚本 | 干什么 | 怎么跑 |
 | --- | --- | --- |
 | `check-layering.py` | 机械校验分层依赖方向（`禁止方向 0 违规` 才算过） | `python tools/check-layering.py` |
 | `smoke/verify_all.py` | 真实链路 45 项断言：协同事件流 / 控制面 / Agent Lab / 书签 / 诊断 / 草稿 / 摘录 | `python tools/smoke/verify_all.py`（需应用已起，`HEALTHOS_BASE` 可覆盖地址） |
 | `smoke/verify_ocr.py` | OCR 23 项断言：服务契约（405 即在线）/ 应用侧探活 / 扫描件入库后 chunk 与识别结果**逐字对账** | `HEALTHOS_OCR_PROVIDER=paddle python tools/smoke/verify_ocr.py`（需应用与 OCR 服务都已起） |
+| `smoke/verify_auth_store.py` | 认证状态「重启不丢」：分四段跑（`before-restart` / `after-restart` / `throttle-before` / `throttle-after`），**中间要手动重启应用**——只在同一进程里测等于什么都没验 | `python tools/smoke/verify_auth_store.py before-restart`，重启后再跑 `after-restart` |
 | `smoke/verify_model_usage.py` | 用量记账 / 三档单价 / 峰谷倍数 / 双闸门的 13 项断言。**打真实上游**（配了有效密钥时），同一问题连打两次用来确认第二次 `cachedPromptTokens > 0` | `HEALTHOS_QUESTION=... python tools/smoke/verify_model_usage.py`（`HEALTHOS_ROUNDS` 默认 2，`HEALTHOS_DOCUMENT` 指定问答绑定的文档） |
 
 两个桩都在 `docker-compose.yml` 里以 profile 形式编排，**默认不启动**——

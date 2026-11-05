@@ -219,7 +219,7 @@ POST /api/v1/retrieval                   page_size + similarity_threshold
 
 ## 3. 跑通了什么（实测结果，非声称）
 
-`mvn clean verify`：**516 个单元测试全部通过，BUILD SUCCESS**（65 个测试类）；分层依赖校验 0 违规（86 包 / 321 类 / 925 条跨包引用）。
+`mvn clean verify`：**526 个单元测试全部通过，BUILD SUCCESS**（66 个测试类）；分层依赖校验 0 违规（87 包 / 326 类 / 932 条跨包引用）。
 
 覆盖：分段 / 二分 / 合并 / 重试策略 / 证据定位 / 令牌 / 检索 / 指标判定 /
 OCR 行重建（6）/ OCR 响应解析（6）/ 扫描件判定与归一化（6）/ 规则抽取（9）/
@@ -227,8 +227,11 @@ OCR 行重建（6）/ OCR 响应解析（6）/ 扫描件判定与归一化（6�
 轨迹上下文与跨线程搬运（6）/ OTLP 导出（3）/ 轨迹写入与截断（9）/ 保留策略清理（3）/
 CSV 解析（5）/ 患者生命周期与乐观锁（12）/ 批次导入（4）/ 孤儿判定（4）/ 删除四段式（6）/
 **owner 隔离（15）** / **资料录入规则抽取（22）** / **资料录入流程关卡（24）** /
-**认证与授权（49）**：令牌 v2 与吊销（8）/ 口令哈希（5）/ 登录限流（7）/ 吊销名单（5）/
+**认证与授权（59）**：令牌 v2 与吊销（8）/ 口令哈希（5）/ 登录限流（7）/ 吊销名单（5）/
 认证服务（10）/ Cookie 属性（3）/ 角色现算（6）/ 解析器与滑动续期（5）/
+**认证状态落库（10）**：本地无记录但库里有仍判吊销（重启/换节点）/ 重复吊销幂等 / 过期不算吊销 /
+库异常降级并置位 degraded / memory 模式不碰库 / 失败计数传参口径 / 库内锁定直接 429 /
+锁定到期清理 / 成功清零 / 库不可用时限流降级 /
 **照护文档导出（7）**：PDF 真实字体渲染与分页（4）/ JSON 导出与未完成拦截（3）/
 **典籍产物（6）** / **患者知识库绑定（9）**：含跨库去重与文档归属（2）/
 **检索结果带文档归属（4）**：本地 provider 填 ID（2）/ 跨库逐条定位（2）/
@@ -547,7 +550,7 @@ QUEUED → RUNNING → SUCCEEDED
 
 | 取舍 | 原因 | 代价 |
 |---|---|---|
-| 吊销名单与限流计数都在**内存** | 生命周期天生等于令牌剩余寿命，为它建表要配清理任务 + 跨节点一致性，收益不成比例 | 重启即清空、多实例不共享；集群化必须换共享存储 |
+| 吊销名单与限流计数**落库**（`auth_session_revocation` / `auth_login_attempt`） | 留在内存有两个安全缺口：重启后吊销名单清空（登出过的令牌又活了）、多实例各存一份（在 A 登出后打 B 照样进得去）。两张表的读写都走主键（约 0.1ms），换掉一个安全缺口是划算的 | 每次请求多一次主键查询；库不可用时降级到本地名单（会打 warn 且 `/health/dependencies` 显示 `store=jdbc:DEGRADED`）。`auth.session-store=memory` 仍可切回纯内存，仅供单实例调试 |
 | 登录限流**按账号**而不是按 IP | 换 IP 成本极低；按账号才真正保护目标账号 | 攻击者可用别人的账号名把自己锁在门外，所以阈值 5 次 / 15 分钟压得较短 |
 | 口令**自己实现 PBKDF2**，不引 spring-security-crypto | 只需要"校验一个口令"，引整个 security 会顺带激活默认过滤器链，要写更多配置去关掉 | 没有提供多算法协商、密码策略等能力（本工程也用不到） |
 
@@ -1021,6 +1024,7 @@ python tools/check-layering.py --verbose  # 附带包规模与依赖矩阵
 
 python tools/smoke/verify_all.py          # 真实链路 45 项断言（需应用已起）
 python tools/smoke/verify_ocr.py          # OCR 契约 + 探活 + 端到端 23 项（需 OCR 服务已起）
+python tools/smoke/verify_auth_store.py   # 认证状态「重启不丢」：分四段跑，中间要手动重启应用
 ```
 
 | 禁止方向 | 为什么 |
@@ -1126,6 +1130,7 @@ RAGFlow 返回的切片没有页码与字符区间，`HybridKnowledgeBase.enrich
 | `HEALTHOS_AUTH_USER` / `_PASSWORD` | `admin` / `admin123` | 登录账号（本地明文；非 local 必须是 `{pbkdf2}` 哈希） |
 | `HEALTHOS_SESSION_SECRET` | `local-dev-only-change-me` | 会话签名密钥；非 local 要求 ≥32 字节，否则拒绝启动 |
 | `HEALTHOS_COOKIE_SECURE` | `false` | Cookie 的 `Secure` 标记；**HTTPS 部署必须置 true**，本地 http 必须 false |
+| `HEALTHOS_AUTH_SESSION_STORE` | `jdbc` | 吊销名单与失败计数的存储：`jdbc`（落库、重启不丢、多实例共享）或 `memory`（仅单实例调试；重启即清空、多实例各算各的） |
 | `HEALTHOS_AI_PROVIDER` | `template` | `template` 或 `openai` |
 | `HEALTHOS_AI_BASE_URL` / `_API_KEY` / `_MODEL` | DeepSeek 默认 | 真实模型接入 |
 
@@ -1402,7 +1407,7 @@ java -cp target/classes com.kangheng.healthos.service.auth.PasswordHash '你的�
 | 患者长效记忆与随访 | `memory_*` 一族：不可变版本链、只从冻结来源取事实、随访幂等、Agent 摘录 | **已实现主干**：`patient_memory_version`（不可变版本链 + `contentHash`/`sourceHash`）、`patient_memory_state`（当前指针）、`patient_followup`（原文照搬）、`patient_memory_job`（异步发布，QUEUED→RUNNING→SUCCEEDED/FAILED/CANCELLED）；事实只从已落库档案修订、已签发照护修订、签署记录、打卡采样、随访原文取，逐条记 `contentHash`，导出 Markdown 带 `X-Content-SHA256` 可校验；随访 `operationId` 幂等、`expectedMemoryId` 乐观并发、异步由 Outbox 驱动。**已补摘录候选（收敛版）**：`memory_agent_note` 逐字摘录（`content.contains(quote)` + 覆盖全部分类）、`candidateHash`/`sourceHash`、显式发布与幂等（见 §3.20）；**差在**：无租约 / fencing token / 心跳 / attempt 表；摘录**不直接并入正式记忆版本**，发布凭据落在 note 行内（不污染"只认已发布修订"的冻结来源） | 单实例切片上，租约与 fencing 是为一台机器抢不到锁才需要的冗余；记忆的可信度来自"只认已发布修订"，掺模型摘要就破了这条线 |
 | 多智能体 | 4 角色 + LangGraph + MCP | **已实现编排主干**：`AgentCollaborationService` 承担依赖图（`MEMORY ‖ PIPELINE → LIFESTYLE → SYNTHESIS`）、跳过语义、五类来源校验（`EMPTY_SOURCES`/`UNOBSERVED_SOURCES`/`TOOL_SOURCE_MISSING`/`HANDOFF_SOURCE_MISSING`/`ROLE_SCHEMA_INVALID`）、交接完整性（同轮 + `kind=role` + 成功 + `sha256(output)==outputHash`）与整轮成败判定；**事实由编排层读、执行器只做组织**（`AgentRoleExecutor` SPI），默认实现是**确定性模板执行器**（不调模型，只组织已读到的事实）。**已补齐**：事件流（`agent_run_event` + 增量轮询 + SSE + 断点续传）、控制面（`cancel` / `retry` / 列表 / 节点正文与审计）、断点续跑（重试复用已成功角色节点，不重跑）、Agent Lab 工具目录与三步协议校验（见 §3.17 / §3.18）——**并已支持真 STDIO MCP Server**：`--healthos.agent-lab.transport=stdio` 时拉起 `tools/mcp-server/patient-business.js`，由子进程自己声明工具清单、回调内部只读端点取数（`handshakeMs≈136ms`，实测见 §3.18）。**差在**：执行器不接真实模型；`stdio` 形态只用于这个诊断控制台，不被业务链路当常驻依赖 | 多智能体的难点从来不是"让模型说话"，而是"四个角色各自守规矩、交接可追溯、来源能核对"；先把骨架钉死，接模型时变的只是措辞。子进程形态的价值是证明"外部客户端能按协议接进来"，所以只做一次一进程、不做常驻 |
 | 模型路由 | `model_route_*` 一族：每条业务主线各配各的模型与密钥、版本化、能力探测 | **已实现主干**：`model_routes`（当前指针）+ `model_route_versions`（不可变历史）+ `model_credentials`（AES-256-GCM 加密）+ `model_route_probes`（探测记录）四表；七条主线各自独立配置；乐观并发（`expectedVersion` → `409 MODEL_CONFIG_CONFLICT`）；**回滚 = 用旧配置创建新版本**（版本号单调递增，不拨指针）；四类合成能力探测（`connectivity`/`structured`/`streaming`/`tool_calling`，固定输入 `Return {"ok":true}`，**不碰患者数据、不执行工具**）；密钥 AAD 绑定 + 主密钥指纹 + HMAC 配置指纹；响应一律 `no-store` 且**永不回显明文密钥**；模型配置管理员名单与运维名单分开（`MODEL_ADMIN`）。**差在**：无配置生效灰度（切换即全量）、模型中转成本口径**只覆盖 chat 调用**（embedding 不计量）、无配置变更审计表（变更历史只在版本行里）、探测依赖外网可达（本机实测全部 `MODEL_CONNECTION_FAILED`） | 医疗场景下"哪条主线用哪个模型"必须可控且可追溯。**已补成本/配额**：`model_usage` 逐次记账 + 按主线的当日闸门（§3.22）；但"在没接真模型之前灰度是空转"这个判断没变，所以只做了能真验证的那部分 |
-| 认证 / 会话 | 单账号存 `.secrets/credentials.local.json`；HMAC 令牌无 `jti`，登出只清 Cookie；无限流；口令明文比对 | **已加强**：多账号配置、令牌 v2（带 `jti`/`iat`）、**登出真实吊销**、滑动续期（沿用 `jti`）、按账号的失败锁定（`429`）、PBKDF2-HMAC-SHA256 口令哈希、启动期 fail-fast 自检、`/health/dependencies` 暴露认证姿态。**差在**：吊销名单与限流计数都在**进程内存**（重启清空、多实例不共享，集群化必须换共享存储）；无"记住我"、无刷新令牌、无第三方登录 | 单实例切片上，为吊销记录建表要连带配清理任务与跨节点一致性，收益不成比例；但这些代价必须写出来，不能假装没有 |
+| 认证 / 会话 | 单账号存 `.secrets/credentials.local.json`；HMAC 令牌无 `jti`，登出只清 Cookie；无限流；口令明文比对 | **已加强**：多账号配置、令牌 v2（带 `jti`/`iat`）、**登出真实吊销**、滑动续期（沿用 `jti`）、按账号的失败锁定（`429`）、PBKDF2-HMAC-SHA256 口令哈希、启动期 fail-fast 自检、`/health/dependencies` 暴露认证姿态；**吊销名单与失败计数落库**（重启不丢、多实例共享，已用真实进程验证）。**差在**：没有用户表/角色表（账号仍是配置白名单，无授权管理层）；无"记住我"、无刷新令牌、无第三方登录 | 吊销与限流是安全项，靠"单实例可接受"糊过去等于把两个缺口写成设计；账号体系则属于产品决策，切片阶段不引入 |
 | RBAC | 前端有编排页面、后端无表（静态数据，原型态） | **角色由配置白名单派生**（`ADMIN` / `TRACE_READER` / `USER`），每次请求现算；**没有**角色表、权限点与授权管理接口 | 真实需求是"谁是运维、谁能全局读轨迹"，两个白名单就够；引入 RBAC 表等于为一个未成形的需求先建三层抽象 |
 
 > 两点补充：
@@ -1457,10 +1462,11 @@ java -cp target/classes com.kangheng.healthos.service.auth.PasswordHash '你的�
    记得建表幂等、注册 outbox 处理器、在 `/health/dependencies` 登记新依赖。
 7. **JDK 21**：把 `java.version` 改 21，`InfraConfig` 里两个执行器换成虚拟线程执行器。
 
-改之前先读扩展指南第 9 节「红线」——**63 条**，比具体代码更重要。最容易忘的几条：
+改之前先读扩展指南第 9 节「红线」——**67 条**，比具体代码更重要。最容易忘的几条：
 降级要留痕、无依据不作答、偏移补不上就留 null、配置缺失要启动失败、新依赖必须能在健康检查里看见、
 事件不许打断业务、`eventSeq`/`version` 不许被 `updateById` 回写、终态控制必须幂等、
-子进程不许拿到身份（只给凭证）、记账失败不许阻塞业务、OCR 探活不许只认 2xx（hubserving 的 405 才是在线）。
+子进程不许拿到身份（只给凭证）、记账失败不许阻塞业务、OCR 探活不许只认 2xx（hubserving 的 405 才是在线）、
+会话吊销与失败计数不许只存内存、库不可用时降级要留痕、一条语句里不许对同一行改两次。
 
 ---
 
@@ -1469,7 +1475,11 @@ java -cp target/classes com.kangheng.healthos.service.auth.PasswordHash '你的�
 - **没有用户表与角色表**：账号来自配置白名单，`/me` 的 `roles` 由 `ADMIN` / `TRACE_READER` / `USER`
   三份配置清单**每次请求现算**，不是固定返回值。因此也不存在"改角色"的接口——
   改配置即改角色，没有授权管理层。
-- **吊销名单与登录失败计数都在进程内存**：重启即清空，多实例不共享。集群化前必须换共享存储。
+- **会话吊销名单与登录失败计数已落库**（原来在进程内存，已改）：重启不丢、多实例共享，
+  已用真实进程验证——登出后重启，旧 Cookie 仍 `401`；失败计数锁定后重启，仍 `429`。
+  `auth.session-store=memory` 可切回纯内存，但那只适合单实例调试：内存模式下"重启即恢复登录"
+  和"A 登出、B 放行"都成立。库不可用时自动降级到本地名单并留痕
+  （`/health/dependencies` 显示 `store=jdbc:DEGRADED`），此时跨节点仍会漏判。
 - 调度器为单机 `@Scheduled`，多实例靠 `SKIP LOCKED` 保证不重复执行，但没有做任务均衡。
 - 指标只做单点越界判定，没有趋势、复合指标与参考区间分人群。
 - **OCR 精度受引擎限制，选引擎要紧**：同一张 `samples/scan-page.png`，Tesseract 有 4 处实质错误

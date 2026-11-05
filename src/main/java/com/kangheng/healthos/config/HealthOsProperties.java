@@ -101,6 +101,15 @@ public class HealthOsProperties {
          * 走 HTTPS 的部署必须置 true，否则令牌会在明文信道上传输。
          */
         private boolean cookieSecure = false;
+        /**
+         * 会话吊销名单与登录失败计数的存储位置：{@code jdbc}（默认）/ {@code memory}。
+         *
+         * <p>默认 {@code jdbc}。内存模式看着省事，代价是两条安全缺口：
+         * 重启后吊销名单清空（登出过的令牌又活了）、多实例各存一份
+         * （在 A 登出后拿同一张 Cookie 打 B 照样进得去）。所以它只留给单实例本地调试，
+         * 选中时会打 warn。
+         */
+        private String sessionStore = "jdbc";
 
         @Data
         public static class User {

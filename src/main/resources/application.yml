@@ -75,6 +75,12 @@ healthos:
     # 5 次 / 15 分钟把爆库速度压到每分钟 0.33 次以内。
     max-login-attempts: 5
     lock-duration: 15m
+    # 会话吊销名单与登录失败计数的存储位置。
+    #   jdbc（默认）：落 auth_session_revocation / auth_login_attempt 两张表，重启不丢、多实例共享；
+    #   memory：留在进程内存，重启即清空、多实例各算各的。**只用于单实例本地调试**。
+    # 为什么默认 jdbc：内存模式下"登出过的令牌在重启后又活了""在 A 登出后打 B 照样进得去"，
+    # 这两个都是安全缺口，不是可接受的单机取舍。
+    session-store: ${HEALTHOS_AUTH_SESSION_STORE:jdbc}
     # 多账号（可选）。配了 users 就以列表为准，没配仍用上面的单账号。
     # 患者域按归属人隔离，第二个账号一出现，漏掉 owner 条件就等于越权读。
     # 非 local 环境下口令必须是哈希：java -cp target/classes \

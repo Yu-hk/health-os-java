@@ -1042,12 +1042,16 @@ CJK 按字断行、西文在空格回退、控制字符与代理项替换。要�
 | OCR `base-url` **不许带路径**，只许 scheme+host+port | 带路径拼接会得到 `http://h//ocr`，看起来像服务端 404，实际是本地配置错 |
 | OCR 服务**只吃图片**，PDF 逐页渲染归应用侧（`PdfPageRenderer`） | 让 OCR 服务装 PDF 依赖等于把渲染逻辑实现两遍，还多一份 GPL/字体问题 |
 | 换 OCR 引擎**必须留两个变体可切**，不许直接替换 | 识别质量与体积是两条反向曲线（Paddle 更准但重 20 倍），一刀切会让"只想验证链路"的人付出 8 GB 代价 |
+| 会话吊销与登录失败计数**不许只存进程内存** | 两件事都是安全缺口而不是可用性取舍：重启后登出失效（令牌"复活"）、多实例各算各的（阈值变 N 倍）。默认 `jdbc`，`memory` 只留给单实例调试并打 warn |
+| 认证状态落库后，**库不可用必须降级且留痕** | 直接抛错会让库抖一下就把全站登出判断打成 500；静默放行则等于吊销与限流同时失效。降级到本地名单 + warn + `/health/dependencies` 显示 `store=jdbc:DEGRADED` |
+| 数据修改型 CTE 与外层 UPDATE **不许改同一行** | PostgreSQL 不报错、第二次修改**静默不生效**。真踩过：`fail_count` 一路涨到 8，而 `locked_until` 始终为空，锁定根本不会触发。要么压成一条 `INSERT ... ON CONFLICT ... RETURNING`，要么分两条语句 |
+| 「写一次读多次」的状态，**读路径不许依赖写入端的进程内缓存** | 多实例下另一个节点看不到你的缓存。库是权威，本地那份只能是降级兜底，且必须能被判定为"降级中" |
 
 ---
 
 ## 10. 扩展后的验收清单
 
-1. `mvn -B test` 全绿（当前 516 个用例）；
+1. `mvn -B test` 全绿（当前 526 个用例）；
 2. `python tools/check-layering.py` 通过——加实现/加域之后，依赖方向别倒（见 README §5.3）；
 3. `/health/dependencies` 的 `status=ready`，新依赖出现在返回体里；
 4. 走一遍真实链路（上传 → 五节点 → 问答），节点 detail 里的 `engine/provider/store` 是新实现的标识；
@@ -1100,3 +1104,13 @@ CJK 按字断行、西文在空格回退、控制字符与代理项替换。要�
     且 `results[0].text` 非空，随后库里的 chunk 正文要与识别结果**逐字一致**（不是"看起来有字"）；
     ③ `--healthos.ocr.protocol` 与 `provider` 填不一致的值，必须**启动失败**；
     ④ `base-url` 带路径（如 `http://127.0.0.1:8868/ocr`）必须**启动失败**。
+24. 改了认证状态存储：**必须真重启一次进程**，只在同一个进程里测等于什么都没验。
+    脚本 `python tools/smoke/verify_auth_store.py`，四段按顺序跑，中间手动重启：
+    ① `before-restart` —— 登录 → 登出 → 同一张 Cookie 立即 `401`，并把 Cookie 存到 `.local/`；
+    ② 重启应用 → `after-restart` —— 旧 Cookie **仍 `401`**（内存实现到这一步会返回 200），
+       同时**对照组**要用新登录的会话确认仍是 `200` —— 否则"拒绝"可能只是"令牌全失效"的假象；
+    ③ `throttle-before` —— 用探针账号（默认 `lockout-probe`，故意不用 admin，
+       否则验证完会把真账号锁 15 分钟）连续错口令到 `429`；
+    ④ 再重启 → `throttle-after` —— 仍 `429`（失败计数跨重启）。
+    另外看 `/health/dependencies` 的 `auth` 字段：`store=jdbc` 才算走了库，
+    出现 `jdbc:DEGRADED` 说明已经降级过、跨节点会漏判。

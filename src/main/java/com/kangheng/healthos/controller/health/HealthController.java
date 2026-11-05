@@ -46,6 +46,7 @@ public class HealthController {
     private final com.kangheng.healthos.service.tracing.TracingService tracing;
     private final com.kangheng.healthos.service.care.CarePdfRenderer carePdfRenderer;
     private final com.kangheng.healthos.spi.ai.EmbeddingModel embeddingModel;
+    private final com.kangheng.healthos.service.auth.SessionRevocationRegistry revocations;
 
     public HealthController(JdbcTemplate jdbcTemplate,
                             ObjectStorage storage,
@@ -57,7 +58,8 @@ public class HealthController {
                             com.kangheng.healthos.service.qa.BranchOrchestrator branchOrchestrator,
                             com.kangheng.healthos.service.tracing.TracingService tracing,
                             com.kangheng.healthos.service.care.CarePdfRenderer carePdfRenderer,
-                            com.kangheng.healthos.spi.ai.EmbeddingModel embeddingModel) {
+                            com.kangheng.healthos.spi.ai.EmbeddingModel embeddingModel,
+                            com.kangheng.healthos.service.auth.SessionRevocationRegistry revocations) {
         this.jdbcTemplate = jdbcTemplate;
         this.storage = storage;
         this.llmProvider = llmProvider;
@@ -69,6 +71,7 @@ public class HealthController {
         this.tracing = tracing;
         this.carePdfRenderer = carePdfRenderer;
         this.embeddingModel = embeddingModel;
+        this.revocations = revocations;
     }
 
     @GetMapping("/health")
@@ -165,7 +168,26 @@ public class HealthController {
         }
         return "session:v2(ttl=" + auth.getSessionTtl().toSeconds() + "s"
                 + ",secure=" + auth.isCookieSecure()
-                + ",passwords=" + (hashed ? "pbkdf2" : "plaintext") + ")";
+                + ",passwords=" + (hashed ? "pbkdf2" : "plaintext")
+                + ",store=" + sessionStorePosture() + ")";
+    }
+
+    /**
+     * 会话吊销名单的存储姿态。
+     *
+     * <p>三种取值都要能一眼分辨，否则"看着 ok、其实登出已经不可靠"就查不出来：
+     * <ul>
+     *   <li>{@code jdbc} —— 落库，重启不丢、多实例共享；</li>
+     *   <li>{@code jdbc:DEGRADED} —— 落库模式但已经出现过库读写失败、退回过本地名单。
+     *       此时登出只在本实例可靠，跨节点或重启会漏；</li>
+     *   <li>{@code memory} —— 明确配置成内存模式，只适合单实例本地调试。</li>
+     * </ul>
+     */
+    private String sessionStorePosture() {
+        if (!revocations.shared()) {
+            return "memory";
+        }
+        return revocations.degraded() ? "jdbc:DEGRADED" : "jdbc";
     }
 
     /** PDF 能力姿态：不含路径之外的信息，够运维判断"要不要装字体"。 */

@@ -1164,8 +1164,12 @@ sequenceDiagram
 3. **续期沿用原 `jti`**。换标识会让"登出 → 刚续出来的新令牌"绕过吊销名单，
    这个洞不会报错，只会静默存在。
 
-吊销名单与限流计数都在进程内存：**单实例够用，集群化必须换共享存储**
-（重启清空、多实例不共享），这一点写在 README §9 差异清单里，不含糊过去。
+吊销名单与限流计数**落库**（`auth_session_revocation` / `auth_login_attempt`）：
+重启不丢、多实例共享。这两件事原来是内存实现，看起来"单实例够用"，
+实际是两条安全缺口——重启后登出过的令牌又活了、在 A 登出后拿同一张 Cookie 打 B 照样进得去。
+库不可用时降级到本地名单并留痕（`/health/dependencies` 显示 `store=jdbc:DEGRADED`），
+`auth.session-store=memory` 仍可切回纯内存，但只适合单实例调试。
+详见 README §11 与 `docs/extending/EXTENDING.md` §9 红线。
 
 ---
 
