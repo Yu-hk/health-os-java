@@ -5,7 +5,7 @@
   const CATEGORIES = ["diet", "symptoms", "exercise", "lifestyle"];
 
   function genOpId() {
-    return "op_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+    return UI.operationId();
   }
 
   async function render(ctx) {
@@ -23,6 +23,7 @@
       const v = el.querySelector("#mem-pid").value.trim();
       if (v) HOS.router.go("/memory/" + v);
     };
+    UI.resourcePicker(el.querySelector("#mem-pid"), "patientId");
   }
 
   async function renderDetail(ctx, patientId) {

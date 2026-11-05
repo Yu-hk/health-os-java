@@ -16,7 +16,7 @@
     document.getElementById("upload-intake").onclick = openUpload;
 
     try {
-      const page = await Api.get("/api/v1/patient-intakes?size=50");
+      const page = await Api.get("/api/v1/patient-intakes?size=50&page=" + (Number(ctx.query.page) || 1));
       const rows = (page && page.items) || page || [];
       document.getElementById("intake-table").innerHTML = UI.table([
         { key: "id", label: "录入单 ID", cls: "code" },
@@ -28,6 +28,7 @@
         { key: "createdAt", label: "创建时间", render: v => UI.date(v) },
         { key: "op", label: "操作", render: (v, r) => '<a class="btn btn-sm" href="#/intake/' + r.id + '">详情</a>' },
       ], rows, "还没有录入单，点击右上角上传体检资料。");
+      UI.listTools(ctx, document.getElementById("intake-table"), page, "/intake");
     } catch (e) { UI.toastErr(e); }
   }
 
@@ -59,16 +60,25 @@
     catch (e) { UI.toastErr(e); el.innerHTML = '<div class="empty">加载失败</div>'; return; }
 
     HOS.app.setHead("录入单 · " + examId,
+      '<button class="btn" id="intake-refresh">刷新进度</button>' +
+      (v.status === "CONFIRMED" ? '<a class="btn btn-primary" href="#/care?examId=' + encodeURIComponent(examId) + '&patientId=' + encodeURIComponent(v.patientId || '') + '">生成健康评估报告</a>' : '') +
       '<button class="btn" id="back">← 返回</button>' +
       (v.status === "EXTRACTED" ? '<button class="btn btn-primary" id="review">核查</button>' : "") +
-      (v.basicReviewStatus === "CONFIRMED" && v.clinicalReviewStatus === "CONFIRMED" ? '<button class="btn btn-primary" id="confirm">确认建档</button>' : ""));
+      (v.status === "EXTRACTED" && v.basicReviewStatus === "CONFIRMED" && v.clinicalReviewStatus === "CONFIRMED" ? '<button class="btn btn-primary" id="confirm">确认建档</button>' : ""));
 
     const agg = v.aggregate || {};
+    document.getElementById("intake-refresh").onclick = HOS.router.resolve;
+    if (["UPLOADED", "EXTRACTING"].includes(v.status)) UI.poll(ctx, async () => {
+      const latest = await Api.get("/api/v1/patient-intakes/" + encodeURIComponent(examId));
+      if (latest.status !== v.status || latest.revision !== v.revision) { HOS.router.resolve(); return false; }
+    }, 3000);
     const fields = agg.fields || {};
     const metrics = v.parts ? v.parts.flatMap(p => p.metrics || []) : [];
 
     el.innerHTML =
       '<div class="toolbar"><button class="btn" id="back2">← 返回列表</button></div>' +
+      (v.errorMessage ? '<div class="notice danger">' + UI.escapeHtml(v.errorMessage) + '</div>' : '') +
+      '<div class="card"><h3>核查进度</h3><div class="toolbar">基础信息 ' + UI.pill(v.basicReviewStatus) + ' 临床内容 ' + UI.pill(v.clinicalReviewStatus) + '</div><p class="muted">' + UI.escapeHtml(v.basicReviewNote || '') + ' ' + UI.escapeHtml(v.clinicalReviewNote || '') + '</p></div>' +
       '<div class="card"><h3>抽取概要</h3><dl class="kv">' +
         "<dt>状态</dt><dd>" + UI.pill(v.status) + "</dd>" +
         "<dt>来源文件</dt><dd>" + UI.escapeHtml(v.sourceFilename) + "</dd>" +

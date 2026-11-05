@@ -49,11 +49,14 @@
     btn.onclick = async () => {
       const f = UI.readForm(body);
       if (!f.question) { UI.toast("请输入问题", "warn"); return; }
+      btn.disabled = true;
       out.innerHTML = UI.spinner() + " 提问中…";
       try {
         const r = await Api.post("/api/v1/qa/ask", { question: f.question, documentId: f.documentId || null, conversationId: f.conversationId || null, patientId: f.patientId || null, mode: f.mode || "single" });
         out.innerHTML = renderAskResult(r);
+        if (r.conversationId) body.querySelector('[name="conversationId"]').value = r.conversationId;
       } catch (e) { UI.toastErr(e); out.innerHTML = '<div class="empty">问答失败</div>'; }
+      finally { btn.disabled = false; }
     };
   }
 
@@ -184,17 +187,20 @@
       '<div class="card"><h3>节点</h3><div id="run-nodes"></div></div>' +
       '<div class="card"><h3>事件流（SSE / 增量）</h3><div id="run-events" style="max-height:300px;overflow:auto;font-size:12px;"></div></div>';
 
-    poll(runId, el);
+    ctx.onLeave(() => { if (pollTimer) clearTimeout(pollTimer); pollTimer = null; if (activeStream) activeStream.close(); activeStream = null; });
+    poll(runId, ctx);
   }
 
   let pollTimer = null;
-  async function poll(runId, el) {
+  async function poll(runId, ctx) {
     const statusEl = document.getElementById("run-status");
     const ansEl = document.getElementById("run-answer");
     const nodesEl = document.getElementById("run-nodes");
     const tick = async () => {
+      if (!ctx.isActive()) return;
       try {
         const d = await Api.get("/api/v1/qa/runs/" + runId);
+        if (!ctx.isActive()) return;
         statusEl.innerHTML = UI.pill(d.status) + (d.errorCode ? " " + UI.escapeHtml(d.errorCode) : "");
         ansEl.textContent = d.answer || "（暂无回答）";
         nodesEl.innerHTML = UI.table([
@@ -204,13 +210,14 @@
           { key: "errorMessage", label: "错误" },
         ], d.nodes || [], "无节点");
         if (["SUCCEEDED", "FAILED", "CANCELLED"].includes(d.status)) {
-          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          pollTimer = null;
+          return;
         }
-      } catch (e) { /* 忽略单次失败 */ }
+      } catch (e) { if (ctx.isActive()) { UI.toastErr(e); ansEl.textContent = "读取运行状态失败，请刷新页面重试。"; } return; }
+      if (ctx.isActive()) pollTimer = setTimeout(tick, 1500);
     };
+    if (pollTimer) clearTimeout(pollTimer);
     await tick();
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(tick, 1500);
   }
 
   function subscribeStream(runId, el) {
@@ -219,13 +226,15 @@
     box.innerHTML = "";
     const es = new EventSource("/api/v1/qa/runs/" + runId + "/stream?afterSeq=0");
     activeStream = es;
-    es.onmessage = (ev) => {
+    const onEvent = (ev) => {
       let data;
       try { data = JSON.parse(ev.data); } catch (e) { return; }
       const line = document.createElement("div");
       line.textContent = "[" + (data.seq != null ? data.seq : "?") + "] " + (data.type || "") + " " + JSON.stringify(data.payload || "");
       box.prepend(line);
+      if (["run.finished", "run.failed", "run.cancelled"].includes(data.type)) { es.close(); activeStream = null; }
     };
+    ["run.accepted", "run.started", "run.finished", "run.failed", "run.cancelled", "run.retry", "node.started", "node.succeeded", "node.failed", "node.skipped", "message"].forEach(type => es.addEventListener(type, onEvent));
     es.onerror = () => { UI.toast("事件流连接关闭", "warn"); es.close(); activeStream = null; };
     UI.toast("已订阅事件流", "ok");
   }

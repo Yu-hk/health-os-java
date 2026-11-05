@@ -3,27 +3,29 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Health-OS 工作台</title>
+  <title>康衡 HealthOS · 健康管理工作台</title>
   <link rel="stylesheet" href="/assets/app.css" />
+  <link rel="stylesheet" href="/assets/workspace.css" />
 </head>
 <body>
   <!-- 登录遮罩 -->
   <div id="login-screen" class="login-screen hidden">
+    <div class="login-story"><div class="eyebrow">康衡 HEALTHOS</div><h1>让健康信息<br>成为连续的照护</h1><p>连接资料、知识与行动，<br>为每一次健康决策保留依据。</p><div class="login-story-foot">资料核查 / 健康档案 / 循证问答 / 持续随访</div></div>
     <div class="login-card">
       <div class="login-brand">
         <div class="login-logo">H</div>
         <div>
-          <div class="login-title">Health-OS 工作台</div>
-          <div class="login-sub">医疗 AI 平台 · 控制台</div>
+          <div class="login-title">欢迎回到康衡</div>
+          <div class="login-sub">登录健康管理工作台</div>
         </div>
       </div>
       <form id="login-form" class="login-form">
-        <label>用户名</label>
-        <input id="login-username" type="text" autocomplete="username" value="admin" />
-        <label>口令</label>
-        <input id="login-password" type="password" autocomplete="current-password" value="admin123" />
+        <label for="login-username">用户名</label>
+        <input id="login-username" type="text" autocomplete="username" value="admin" required />
+        <label for="login-password">登录密码</label>
+        <input id="login-password" type="password" autocomplete="current-password" required />
         <button type="submit" id="login-btn">登录</button>
-        <div id="login-error" class="login-error hidden"></div>
+        <div id="login-error" class="login-error hidden" role="alert"></div>
       </form>
       <div class="login-hint">默认演示账号 admin / admin123（可在 application.yml 修改）</div>
     </div>
@@ -34,24 +36,25 @@
     <aside class="sidebar">
       <div class="sidebar-brand">
         <div class="sidebar-logo">H</div>
-        <span>Health-OS</span>
+        <span>康衡 HealthOS<small class="brand-caption">健康管理工作空间</small></span>
       </div>
-      <nav id="sidebar-nav" class="sidebar-nav"></nav>
+      <nav id="sidebar-nav" class="sidebar-nav" aria-label="主导航"></nav>
       <div class="sidebar-foot">
         <div id="current-user" class="current-user"></div>
         <button id="logout-btn" class="btn-ghost">退出登录</button>
       </div>
     </aside>
+    <button id="nav-backdrop" class="nav-backdrop" aria-label="关闭导航"></button>
     <main class="content">
       <header class="content-head">
-        <div id="breadcrumb" class="breadcrumb"></div>
+        <div class="heading-main"><button id="nav-toggle" class="btn nav-toggle" aria-label="展开导航" aria-expanded="false">☰</button><div><div class="header-brand">康衡 HealthOS / 工作空间</div><div id="breadcrumb" class="breadcrumb"></div></div></div>
         <div id="head-actions" class="head-actions"></div>
       </header>
-      <section id="page" class="page"></section>
+      <section id="page" class="page" aria-live="polite"></section>
     </main>
   </div>
 
-  <div id="toast-host" class="toast-host"></div>
+  <div id="toast-host" class="toast-host" role="status" aria-live="polite"></div>
   <div id="modal-host" class="modal-host hidden"></div>
 
   <script src="/assets/api.js"></script>
@@ -64,6 +67,10 @@
   <script src="/assets/pages/classics.js"></script>
   <script src="/assets/pages/qa.js"></script>
   <script src="/assets/pages/memory.js"></script>
+  <script src="/assets/pages/models.js"></script>
+  <script src="/assets/pages/traces.js"></script>
+  <script src="/assets/pages/agents.js"></script>
+  <script src="/assets/pages/graph.js"></script>
   <script src="/assets/app.js"></script>
 </body>
 </html>

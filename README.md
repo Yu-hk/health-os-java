@@ -48,7 +48,7 @@ curl -b /tmp/ck.txt -c /tmp/ck.txt -X POST http://127.0.0.1:18100/api/v1/auth/lo
 默认走 `template` 模型提供者（规则抽取，**不需要任何 API Key**），
 所以上面的命令开箱即能跑出实体、关系、证据和带引用的问答。
 
-需要 Node.js（≥18，实测 v22）**只有**一种情况：想验证「真子进程 MCP」形态，
+运行默认控制台不需要 Node.js。验证「真子进程 MCP」形态时需要 Node.js（≥18，实测 v22），
 启动时加 `--healthos.agent-lab.transport=stdio`（默认 `in-process`，不依赖 node）。
 见 §3.18。
 
@@ -57,6 +57,8 @@ curl -b /tmp/ck.txt -c /tmp/ck.txt -X POST http://127.0.0.1:18100/api/v1/auth/lo
 **Web 控制台（前端）**：应用启动后直接访问 `http://127.0.0.1:18100/` 即可打开内置控制台
 （纯静态前端，由 Spring 托管在 `src/main/resources/static`，同源调用 API，登录后可用）。
 默认演示账号 `admin / admin123`。
+
+工作台包含分组导航、真实统计与服务状态、患者到报告/计划的连续流程，以及典籍图谱、Agent/MCP、模型配置和链路追踪入口。前端随 JAR 一起发布。操作说明见 [Web 工作台](docs/frontend/README.md)。前端回归需要 Node.js 22+：`npm ci` 后执行 `npm run test:web`。
 
 > 注意：本机若设置了 `HTTP_PROXY`，curl 访问 localhost 会被代理拦截，请加 `--noproxy '*'`。
 > 端口被占用时用 `--server.port=` 显式指定。

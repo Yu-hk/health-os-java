@@ -30,8 +30,8 @@
       tabBody.innerHTML = UI.spinner();
       try {
         const list = t === "reports"
-          ? await Api.get("/api/v1/care/reports?limit=100")
-          : await Api.get("/api/v1/care/plans?limit=100");
+          ? await Api.get("/api/v1/care/reports?limit=100" + (ctx.query.patientId ? "&patientId=" + encodeURIComponent(ctx.query.patientId) : ""))
+          : await Api.get("/api/v1/care/plans?limit=100" + (ctx.query.patientId ? "&patientId=" + encodeURIComponent(ctx.query.patientId) : ""));
         tabBody.innerHTML = '<div class="card"><h3>' + (t === "reports" ? "报告" : "计划") + ' <span class="sub">' + list.length + " 份</span></h3>" +
           UI.table([
             { key: "id", label: "文档 ID", cls: "code" },
@@ -75,16 +75,18 @@
     try { d = await Api.get("/api/v1/care/documents/" + documentId); }
     catch (e) { UI.toastErr(e); el.innerHTML = '<div class="empty">加载失败</div>'; return; }
 
-    HOS.app.setHead((d.kind === "REPORT" ? "报告" : "计划") + " · " + documentId, "");
+    HOS.app.setHead((String(d.kind).toLowerCase() === "report" ? "报告" : "计划") + " · " + documentId, "");
 
     const sig = d.signature;
-    const isReport = d.kind === "REPORT";
-    const canSign = isReport && d.status !== "SIGNED";
-    const canConfirmPlan = !isReport && d.status !== "ACTIVE";
+    const isReport = String(d.kind).toLowerCase() === "report";
+    const canSign = isReport && d.complete && d.status === "DRAFT";
+    const canConfirmPlan = !isReport && d.complete && d.status === "DRAFT";
     const canRevise = d.status === "SIGNED";
 
     const headActions =
       '<button class="btn" id="back">← 返回</button>' +
+      '<button class="btn" id="care-refresh">刷新进度</button>' +
+      (d.patientId ? '<a class="btn" href="#/care?patientId=' + encodeURIComponent(d.patientId) + '">此患者报告与计划</a>' : '') +
       (canSign ? '<button class="btn btn-primary" id="sign">签发</button>' : "") +
       (canConfirmPlan ? '<button class="btn btn-primary" id="confirm-plan">确认生效</button>' : "") +
       (canRevise ? '<button class="btn" id="revise">修订</button>' : "") +
@@ -106,6 +108,11 @@
       '<div id="tab-body"></div>';
 
     document.getElementById("back").onclick = () => HOS.router.go("/care");
+    document.getElementById("care-refresh").onclick = HOS.router.resolve;
+    if (!d.complete) UI.poll(ctx, async () => {
+      const latest = await Api.get("/api/v1/care/documents/" + encodeURIComponent(documentId));
+      if (latest.revision !== d.revision || latest.complete !== d.complete) { HOS.router.resolve(); return false; }
+    }, 3000);
     const signBtn = document.getElementById("sign");
     if (signBtn) signBtn.onclick = () => openSign(d);
     const cpBtn = document.getElementById("confirm-plan");
@@ -135,7 +142,7 @@
   function renderContent(mount, d) {
     const sections = d.sections || [];
     const secHtml = sections.map(s =>
-      '<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;"><h3 style="margin:0;">' + UI.escapeHtml(s.title || s.key) + " " + (s.present ? "" : UI.pill("缺失")) + '</h3><button class="btn btn-sm" data-sec="' + s.key + '">编辑</button></div>' +
+      '<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;"><h3 style="margin:0;">' + UI.escapeHtml(s.title || s.key) + " " + (s.present ? "" : UI.pill("缺失")) + '</h3>' + (d.status === "DRAFT" ? '<button class="btn btn-sm" data-sec="' + s.key + '">编辑</button>' : '') + '</div>' +
       '<div class="wrap" style="margin-top:8px;white-space:pre-wrap;">' + (s.text ? UI.escapeHtml(s.text) : '<span class="muted">（未填写）</span>') + "</div>" +
       (s.metricRefs && s.metricRefs.length ? '<div class="muted" style="margin-top:6px;font-size:12px;">引用指标：' + s.metricRefs.map(UI.escapeHtml).join("、") + "</div>" : "") +
       "</div>"
@@ -143,20 +150,22 @@
 
     const tasks = d.tasks || [];
     const taskHtml = tasks.length ? '<div class="card"><h3>执行任务（打卡）</h3>' + UI.table([
-      { key: "dayIndex", label: "第几周" },
+      { key: "dayIndex", label: "任务序号" },
       { key: "title", label: "标题" },
       { key: "content", label: "内容", cls: "wrap" },
       { key: "category", label: "类别", render: v => UI.pill(v) },
       { key: "completed", label: "状态", render: v => v ? UI.pill("已完成") : UI.pill("待完成") },
-      { key: "op", label: "操作", render: (v, r) => '<button class="btn btn-sm" data-check="' + r.taskId + '">' + (r.completed ? "标记未完成" : "打卡完成") + "</button>" },
+      { key: "op", label: "操作", render: (v, r) => d.status === "ACTIVE" ? '<button class="btn btn-sm" data-check="' + r.taskId + '">' + (r.completed ? "标记未完成" : "打卡完成") + "</button>" : '计划生效后可打卡' },
     ], tasks) + "</div>" : "";
 
     mount.innerHTML = secHtml + taskHtml;
     mount.querySelectorAll("[data-sec]").forEach(b => b.onclick = () => openEditSection(d, b.dataset.sec));
     mount.querySelectorAll("[data-check]").forEach(b => b.onclick = async () => {
       const task = tasks.find(t => t.taskId === b.dataset.check);
-      try { await Api.put("/api/v1/care/documents/" + d.id + "/checkins/" + b.dataset.check, { completed: !task.completed, expectedVersion: (task.version || d.revision) }); UI.toast("已更新打卡", "ok"); const nd = await Api.get("/api/v1/care/documents/" + d.id); renderContent(mount, nd); }
+      b.disabled = true;
+      try { await Api.put("/api/v1/care/documents/" + d.id + "/checkins/" + b.dataset.check, { completed: !task.completed, expectedVersion: (task.version == null ? d.revision : task.version) }); UI.toast("已更新打卡", "ok"); const nd = await Api.get("/api/v1/care/documents/" + d.id); renderContent(mount, nd); }
       catch (e) { UI.toastErr(e); }
+      finally { b.disabled = false; }
     });
   }
 

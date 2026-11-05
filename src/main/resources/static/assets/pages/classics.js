@@ -16,7 +16,7 @@
     document.getElementById("upload-doc").onclick = openUpload;
 
     try {
-      const page = await Api.get("/api/v1/classics?size=50");
+      const page = await Api.get("/api/v1/classics?size=50&page=" + (Number(ctx.query.page) || 1));
       const rows = (page && page.items) || page || [];
       document.getElementById("doc-table").innerHTML = UI.table([
         { key: "id", label: "文档 ID", cls: "code" },
@@ -27,6 +27,7 @@
         { key: "createdAt", label: "创建时间", render: v => UI.date(v) },
         { key: "op", label: "操作", render: (v, r) => '<a class="btn btn-sm" href="#/classics/' + r.id + '">详情</a>' },
       ], rows, "还没有典籍，点击右上角上传。");
+      UI.listTools(ctx, document.getElementById("doc-table"), page, "/classics");
     } catch (e) { UI.toastErr(e); }
   }
 
@@ -67,6 +68,7 @@
     const d = det.document;
     const failed = det.nodes && det.nodes.some(n => n.status === "FAILED");
     HOS.app.setHead("典籍 · " + (d.title || d.id),
+      '<a class="btn" href="#/classics/' + encodeURIComponent(documentId) + '/graph">知识图谱</a><a class="btn" href="#/qa?documentId=' + encodeURIComponent(documentId) + '">基于此典籍问答</a><button class="btn" id="classic-refresh">刷新进度</button>' +
       '<button class="btn" id="back">← 返回</button>' +
       (failed ? '<button class="btn btn-primary" id="retry">重试失败节点</button>' : ""));
 
@@ -96,6 +98,14 @@
 
     document.getElementById("back").onclick = document.getElementById("back2").onclick = () => HOS.router.go("/classics");
     const retryBtn = document.getElementById("retry");
+    document.getElementById("classic-refresh").onclick = HOS.router.resolve;
+    if (!["SUCCEEDED", "FAILED", "READY", "COMPLETED"].includes(d.status)) {
+      const fingerprint = JSON.stringify([d.status, d.currentNode, det.nodes]);
+      UI.poll(ctx, async () => {
+        const latest = await Api.get("/api/v1/classics/" + encodeURIComponent(documentId));
+        if (JSON.stringify([latest.document.status, latest.document.currentNode, latest.nodes]) !== fingerprint) { HOS.router.resolve(); return false; }
+      }, 3000);
+    }
     if (retryBtn) retryBtn.onclick = async () => {
       try { const r = await Api.post("/api/v1/classics/" + documentId + "/retry", {}); UI.toast("已重试：" + r.status, "ok"); HOS.router.go("/classics/" + documentId); }
       catch (e) { UI.toastErr(e); }

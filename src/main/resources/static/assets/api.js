@@ -8,33 +8,41 @@
 
   async function request(method, path, opts) {
     opts = opts || {};
-    const headers = {};
+    const headers = new Headers(opts.headers || {});
     let body = undefined;
     if (opts.form) {
       body = opts.form; // FormData，浏览器自动设 Content-Type
     } else if (opts.body !== undefined && opts.body !== null) {
-      headers["Content-Type"] = "application/json;charset=UTF-8";
+      headers.set("Content-Type", "application/json;charset=UTF-8");
       body = JSON.stringify(opts.body);
     }
-    let resp;
+    const controller = new AbortController();
+    const parent = opts.signal || (global.HOS.router && global.HOS.router.signal);
+    const abort = () => controller.abort();
+    if (parent) { if (parent.aborted) abort(); else parent.addEventListener("abort", abort, { once: true }); }
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, opts.timeout || 120000);
+    let resp, text;
     try {
       resp = await fetch(path, {
         method: method,
         headers: headers,
         body: body,
         credentials: "same-origin",
+        cache: "no-store",
+        signal: controller.signal,
       });
+      if (opts.blob && resp.ok) return await resp.blob();
+      text = await resp.text();
+      if (parent && parent.aborted) throw new DOMException("页面已切换", "AbortError");
     } catch (e) {
+      if (timedOut) throw new ApiError("TIMEOUT", "请求超时，请稍后手动重试", 0);
+      if (e.name === "AbortError") throw e;
       throw new Error("网络错误，无法连接到服务：" + e.message);
+    } finally {
+      clearTimeout(timer);
+      if (parent) parent.removeEventListener("abort", abort);
     }
-
-    // 文件下载（blob）
-    if (opts.blob) {
-      if (!resp.ok) throw new Error("下载失败，HTTP " + resp.status);
-      return resp.blob();
-    }
-
-    const text = await resp.text();
     let data = null;
     if (text) {
       try { data = JSON.parse(text); } catch (e) { data = text; }

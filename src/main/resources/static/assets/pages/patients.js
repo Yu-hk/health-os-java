@@ -16,7 +16,7 @@
     document.getElementById("new-patient").addEventListener("click", openCreate);
 
     try {
-      const page = await Api.get("/api/v1/patients?size=50");
+      const page = await Api.get("/api/v1/patients?size=50&page=" + (Number(ctx.query.page) || 1));
       const rows = (page && page.items) || page || [];
       document.getElementById("patients-table").innerHTML = UI.table([
         { key: "id", label: "ID", cls: "code" },
@@ -28,6 +28,7 @@
         { key: "createdAt", label: "建档时间", render: v => UI.date(v) },
         { key: "op", label: "操作", render: (v, r) => '<a class="btn btn-sm" href="#/patients/' + r.id + '">查看</a>' },
       ], rows, "还没有患者，点击右上角新建。");
+      UI.listTools(ctx, document.getElementById("patients-table"), page, "/patients");
     } catch (e) { UI.toastErr(e); }
   }
 
@@ -68,7 +69,7 @@
     const canConfirm = status === "DRAFT";
     const canArchive = status === "ACTIVE";
     const canRestore = status === "ARCHIVED";
-    HOS.app.setHead("患者 · " + p.name, "");
+    HOS.app.setHead("患者 · " + p.name, '<a class="btn" href="#/care?patientId=' + encodeURIComponent(id) + '">报告与计划</a><a class="btn" href="#/qa?patientId=' + encodeURIComponent(id) + '">发起问答</a><a class="btn" href="#/memory/' + encodeURIComponent(id) + '">长期记忆</a><a class="btn" href="#/agents?patientId=' + encodeURIComponent(id) + '">协同分析</a>');
 
     el.innerHTML =
       '<div class="toolbar">' +

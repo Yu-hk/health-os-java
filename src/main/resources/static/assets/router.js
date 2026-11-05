@@ -1,73 +1,59 @@
-/* 极简 hash 路由：路由都在 # 片段里，服务端只认 '/'，天然 SPA 友好。 */
+/* 每次切换页面取消旧请求、轮询和 SSE；查询串不参与路由匹配。 */
 (function (global) {
   "use strict";
   const HOS = global.HOS = global.HOS || {};
-  const router = { routes: [], pages: {} };
-
-  // pattern 形如 "/patients/:id"；page 为渲染函数 (ctx)=>{}
+  const router = { routes: [], signal: null };
+  let started = false, controller, cleanups = [];
   router.register = function (pattern, page) {
     const keys = [];
-    const regex = new RegExp("^" + pattern.replace(/:[^/]+/g, m => {
-      keys.push(m.slice(1));
-      return "([^/]+)";
+    const regex = new RegExp("^" + pattern.replace(/:[^/]+/g, value => {
+      keys.push(value.slice(1)); return "([^/]+)";
     }) + "$");
     router.routes.push({ regex, keys, page });
   };
-
-  router.go = function (path) {
-    if (location.hash === "#" + path) router.resolve();
-    else location.hash = "#" + path;
-  };
-
-  router.current = function () {
-    return location.hash.replace(/^#/, "") || "/dashboard";
-  };
-
-  router.resolve = async function () {
-    const path = router.current();
-    const el = document.getElementById("page");
-    el.innerHTML = HOS.UI.spinner();
-    let matched = null, params = {};
-    for (const r of router.routes) {
-      const m = path.match(r.regex);
-      if (m) {
-        matched = r;
-        r.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
-        break;
-      }
-    }
-    // 更新导航高亮（取首段）
-    const top = "/" + (path.split("/")[1] || "dashboard");
-    document.querySelectorAll("#sidebar-nav a").forEach(a => {
-      a.classList.toggle("active", a.getAttribute("data-path") === top);
-    });
-
-    if (!matched) {
-      el.innerHTML = '<div class="empty">页面不存在：' + HOS.UI.escapeHtml(path) + "</div>";
-      HOS.app.setHead("未找到", null);
-      return;
-    }
-    try {
-      await matched.page({ params, el, path, query: parseQuery(path) });
-    } catch (e) {
-      HOS.UI.toastErr(e);
-      el.innerHTML = '<div class="empty">加载失败：' + HOS.UI.escapeHtml(e.message) + "</div>";
-    }
-  };
-
-  function parseQuery(path) {
-    const q = {};
-    const i = path.indexOf("?");
-    if (i < 0) return q;
-    new URLSearchParams(path.slice(i + 1)).forEach((v, k) => { q[k] = v; });
-    return q;
+  router.current = () => location.hash.replace(/^#/, "") || "/dashboard";
+  router.query = () => Object.fromEntries(new URLSearchParams(router.current().split("?")[1] || ""));
+  router.onLeave = callback => cleanups.push(callback);
+  function release() {
+    if (controller) controller.abort();
+    cleanups.splice(0).forEach(callback => { try { callback(); } catch (e) { /* continue cleanup */ } });
+    if (HOS.UI.activeModal) HOS.UI.activeModal.close(true);
   }
-
-  router.start = function () {
-    window.addEventListener("hashchange", router.resolve);
-    if (!location.hash) location.hash = "#/dashboard";
-    else router.resolve();
+  router.go = path => { if (location.hash === "#" + path) router.resolve(); else location.hash = "#" + path; };
+  router.resolve = async function () {
+    if (!started || !HOS.app.user) return;
+    release(); controller = new AbortController();
+    const signal = controller.signal;
+    router.signal = signal;
+    const path = router.current().split("?")[0];
+    const host = document.getElementById("page"), el = document.createElement("div");
+    host.replaceChildren(el); el.innerHTML = HOS.UI.spinner();
+    global.scrollTo(0, 0);
+    HOS.app.setHead("加载中…"); document.body.classList.remove("nav-open");
+    let matched, params = {};
+    try {
+      for (const route of router.routes) {
+        const match = path.match(route.regex);
+        if (match) { matched = route; route.keys.forEach((key, i) => { params[key] = decodeURIComponent(match[i + 1]); }); break; }
+      }
+      const top = "/" + (path.split("/")[1] || "dashboard");
+      document.querySelectorAll("#sidebar-nav a").forEach(a => {
+        const active = a.dataset.path === top; a.classList.toggle("active", active);
+        if (active) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+      });
+      if (!matched) { HOS.app.setHead("页面不存在"); el.innerHTML = '<div class="empty">找不到此页面。<a href="#/dashboard">返回工作台</a></div>'; return; }
+      await matched.page({ params, el, path, query: router.query(), signal,
+        isActive: () => !signal.aborted, onLeave: router.onLeave });
+    } catch (e) {
+      if (signal.aborted || e.name === "AbortError") return;
+      el.innerHTML = '<div class="card empty">加载失败：' + HOS.UI.escapeHtml(e.message) + '<p><button class="btn" id="route-retry">重新加载</button></p></div>';
+      el.querySelector("#route-retry").onclick = router.resolve;
+    }
   };
-
+  router.start = function () {
+    if (!started) { started = true; window.addEventListener("hashchange", router.resolve); }
+    if (!location.hash) location.hash = "#/dashboard"; else router.resolve();
+  };
+  router.stop = function () { started = false; release(); router.signal = null; window.removeEventListener("hashchange", router.resolve); };
   HOS.router = router;
 })(window);
