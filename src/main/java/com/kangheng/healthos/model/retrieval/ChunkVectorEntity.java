@@ -10,10 +10,15 @@ import lombok.Data;
 /**
  * 切片向量。
  *
- * <p><b>为什么向量存成 TEXT 而不是 {@code vector(n)}</b>：官方 {@code postgres:16} 镜像不带
- * pgvector，装扩展要重建镜像；本切片的候选集只有几十到几百条，用 JSON 数组 + Java 侧余弦
- * 完全够用，而且 {@code psql} 里能直接看懂。真上 pgvector 时把这一列换成 {@code vector(1024)}
- * 并加 HNSW 索引，改的只是 {@code ChunkVectorService} 的读写两句 SQL。
+ * <p><b>两列存同一份向量，各有各的用处</b>：{@code vector} 是 JSON 文本，任何 Postgres
+ * 都能存，检索时取回内存在 Java 侧算余弦——它是 pgvector 不可用时的唯一退路；
+ * {@code embedding} 是定长 {@code vector(n)} 列，只有装了 pgvector 才有，用来建 HNSW 索引。
+ * 两列都写（{@code embedding} 在扩展不可用时为空）是刻意的：降级路径能真的跑起来，
+ * 而不是"理论上可以降级"。
+ *
+ * <p>{@code embedding} 故意<b>不映射到这个类</b>：MyBatis-Plus 的通用 insert 会把字段按
+ * varchar 写进去，撞上 vector 类型直接报错。定长列只在
+ * {@code ChunkVectorMapper#upsertWithEmbedding} 里用 {@code ?::vector} 显式写入。
  *
  * <p><b>为什么按 {@code (chunk_id, model)} 唯一</b>：换模型后旧向量不能被覆盖。
  * 一是回滚时还能用回去，二是"新模型只索引了一半"时旧向量仍然可查，

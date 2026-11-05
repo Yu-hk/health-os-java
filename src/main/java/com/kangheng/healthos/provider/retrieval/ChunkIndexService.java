@@ -66,6 +66,21 @@ public class ChunkIndexService {
     }
 
     /**
+     * 按 ID 批量取切片。
+     *
+     * <p>给向量召回用：ANN 命中的切片可能远远落在 {@link #chunks} 的位置窗口之外
+     * （比如一本典籍的第 3000 片），只有把它们按 ID 捞回来，才谈得上"长文档也能召回"。
+     * 空集合直接返回空列表——{@code selectBatchIds} 收到空列表会生成
+     * {@code WHERE id IN ()} 这种非法 SQL。
+     */
+    public List<DocumentChunkEntity> byIds(java.util.Collection<String> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return List.of();
+        }
+        return chunkMapper.selectBatchIds(ids);
+    }
+
+    /**
      * 用文本片段反查它在本文件里的位置。
      *
      * <p>用途：RAGFlow 的检索结果只有文本，没有原文偏移。引用要能给到"第几页第几字"，

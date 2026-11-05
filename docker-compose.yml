@@ -1,6 +1,10 @@
 services:
   postgres:
-    image: postgres:16
+    # 带 pgvector 的 Postgres 16。官方 postgres:16 镜像**没有** vector 扩展，
+    # 换掉它的唯一目的就是让 chunk_vector 能建 HNSW 索引（ANN 检索）。
+    # 装不上扩展也不会起不来：应用会降级成"把向量取回内存算余弦"，只在
+    # /health/dependencies 的 vectorIndex 字段留痕。
+    image: pgvector/pgvector:0.8.0-pg16
     container_name: healthos-java-postgres
     environment:
       POSTGRES_DB: healthos

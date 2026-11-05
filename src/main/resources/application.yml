@@ -160,6 +160,8 @@ healthos:
     # 词面与向量的融合权重：0.6 表示向量占六成；纯向量召回的准入门槛 0.45（余弦）
     vector-weight: ${HEALTHOS_RETRIEVAL_VECTOR_WEIGHT:0.6}
     vector-min-score: ${HEALTHOS_RETRIEVAL_VECTOR_MIN_SCORE:0.45}
+    # auto（有就用、没有尝试装）/ pgvector（只认已装的扩展）/ off（不探测）
+    vector-index: ${HEALTHOS_RETRIEVAL_VECTOR_INDEX:auto}
     ragflow:
       base-url: ${HEALTHOS_RAGFLOW_BASE_URL:http://127.0.0.1:9380}
       api-key: ${HEALTHOS_RAGFLOW_API_KEY:}

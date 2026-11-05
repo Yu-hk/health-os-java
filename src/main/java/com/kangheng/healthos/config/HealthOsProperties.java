@@ -186,6 +186,38 @@ public class HealthOsProperties {
          * 避免"任何问题都能从任何文档里挑出 5 条"。
          */
         private double vectorMinScore = 0.45;
+        /**
+         * 向量索引策略：
+         * <ul>
+         *   <li>{@code auto}（默认）—— 库里有 pgvector 就用；没有就尝试装（需要权限），
+         *       装不上退回 Java 侧余弦，不影响启动；</li>
+         *   <li>{@code pgvector} —— 只认已装好的扩展，<b>不</b>尝试 {@code CREATE EXTENSION}；</li>
+         *   <li>{@code off} —— 连探测都不做，行为与加索引之前一致。</li>
+         * </ul>
+         * 三种模式都只是"快慢"的区别：没有索引时检索仍然正确，只是要把整篇的向量取回内存算。
+         */
+        private String vectorIndex = "auto";
+        /**
+         * 交叉编码器重排（cross-encoder rerank）开关。
+         *
+         * <p>{@code false}（默认）—— 不重排，检索走「词面 + 向量」融合序。
+         * 设为 {@code true} 时还需 {@code rerankUrl} 指向一个真的 rerank 端点
+         * （本机 Ollama 0.40 没有 {@code /api/rerank} 且拿不到 logits，所以必须自建，见
+         * {@code tools/rerank-service}）；端点不可用或报错时自动退回融合序，不阻断问答。
+         */
+        private boolean rerankEnabled = false;
+        /** 重排服务地址（{@code /rerank} 与 {@code /health} 两个端点）。 */
+        private String rerankUrl = "http://127.0.0.1:8899";
+        /**
+         * 送给重排器的候选条数（融合序的前 N 条）。cross-encoder 逐对打分比双塔贵，
+         * 不必把全部候选都送进去，取融合序头部这批"本来就有戏"的即可。
+         */
+        private int rerankCandidateLimit = 20;
+        /**
+         * 重排后保留的条数；{@code <=0} 表示沿用 {@code topK}。重排只重排、可截断，
+         * 不会引入候选之外的文本。
+         */
+        private int rerankTopK = 0;
         private Ragflow ragflow = new Ragflow();
     }
 

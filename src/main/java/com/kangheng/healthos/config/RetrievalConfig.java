@@ -3,10 +3,13 @@ package com.kangheng.healthos.config;
 import com.kangheng.healthos.provider.retrieval.ChunkIndexService;
 import com.kangheng.healthos.provider.retrieval.ChunkVectorService;
 import com.kangheng.healthos.provider.retrieval.HybridKnowledgeBase;
-import com.kangheng.healthos.spi.retrieval.KnowledgeBase;
+import com.kangheng.healthos.provider.retrieval.HttpReranker;
 import com.kangheng.healthos.provider.retrieval.LocalKnowledgeBase;
+import com.kangheng.healthos.provider.retrieval.NoopReranker;
 import com.kangheng.healthos.provider.retrieval.RagflowKnowledgeBase;
 import com.kangheng.healthos.mapper.retrieval.KnowledgeIndexMapper;
+import com.kangheng.healthos.spi.retrieval.KnowledgeBase;
+import com.kangheng.healthos.spi.retrieval.RetrievalReranker;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,13 +30,23 @@ public class RetrievalConfig {
     private static final Logger log = LoggerFactory.getLogger(RetrievalConfig.class);
 
     @Bean
+    public RetrievalReranker retrievalReranker(HealthOsProperties properties) {
+        HealthOsProperties.Retrieval config = properties.getRetrieval();
+        if (!config.isRerankEnabled()) {
+            return NoopReranker.INSTANCE;
+        }
+        return new HttpReranker(config.getRerankUrl());
+    }
+
+    @Bean
     public KnowledgeBase knowledgeBase(HealthOsProperties properties,
                                        ChunkIndexService chunkIndexService,
                                        ChunkVectorService chunkVectorService,
-                                       KnowledgeIndexMapper indexMapper) {
+                                       KnowledgeIndexMapper indexMapper,
+                                       RetrievalReranker reranker) {
         HealthOsProperties.Retrieval config = properties.getRetrieval();
         String provider = config.getProvider() == null ? "local" : config.getProvider().toLowerCase();
-        LocalKnowledgeBase local = new LocalKnowledgeBase(chunkIndexService, chunkVectorService, properties);
+        LocalKnowledgeBase local = new LocalKnowledgeBase(chunkIndexService, chunkVectorService, properties, reranker);
 
         if ("local".equals(provider)) {
             if (chunkVectorService.enabled()) {

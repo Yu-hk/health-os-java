@@ -896,13 +896,26 @@ CJK 按字断行、西文在空格回退、控制字符与代理项替换。要�
 | **维度不符必须报错**，不许截断/补零 | 补零会得到"看起来能算"的相似度，是最难查的一类错 |
 | **失败要区分 `retryable`** | 连不上/5xx 值得 60s 后再试；4xx/维度不符再试也没用，别浪费冷却窗口 |
 
-### 上 pgvector
+### 上 pgvector（2026-11-05 已落地）
 
-1. 换镜像或装扩展：`pgvector/pgvector:pg16`，或 `CREATE EXTENSION vector`；
-2. 列改成 `vector(1024)`，`ChunkVectorEntity.vector` 换成 `float[]` + TypeHandler；
-3. 写入改 `INSERT ... ::vector`，查询改 `ORDER BY vector <=> ? LIMIT ?`；
-4. **只动 `ChunkVectorService`**：`KnowledgeBase` 契约、`HybridScorer`、上层问答都不该改。
-   如果改动溢出到这个文件之外，说明抽象漏了。
+实际做法**没有动 `ChunkVectorEntity.vector`**（它仍是 JSON 文本列，作为无扩展时的退路），
+而是新增了一个独立的 `embedding vector(1024)` 定长列 + HNSW 索引：
+
+1. compose 把镜像换成 `pgvector/pgvector:0.8.0-pg16`，或 `CREATE EXTENSION vector`；
+2. `PgVectorIndex`（`provider/retrieval`）在 `ApplicationReadyEvent` 探测扩展，
+   条件加 `chunk_vector.embedding vector(1024)` 列与 `ix_chunk_vector_ann`（HNSW，`vector_cosine_ops`）；
+   **扩展缺失 / 维度不符就降级留痕（`degraded:...`/`disabled:...`），不抛异常、不阻断启动**；
+3. `ChunkVectorMapper` 新增 `upsertWithEmbedding`（`#{row.vector}::vector` 写列）与
+   `searchTopK`（`SELECT chunk_id, 1 - (embedding <=> #{query}::vector) AS score ... LIMIT`）；
+   `embedding` 故意不映射进实体，靠这两句 SQL 显式读写；
+4. `ChunkVectorService` 双路：ANN 可用先走 `searchTopK`，返回空才退回 Java 侧全量余弦；
+   `vector-index=auto/pgvector/off` 可切换（`off` 强制走内存路径）；
+5. **契约层（`KnowledgeBase` / `HybridScorer` / 上层问答）没有改**——`LocalKnowledgeBase.retrieve`
+   只多了"向量命中落在词面窗口外的切片也要补回候选"，这是召回补全，不是接口变更。
+
+验证脚本（对着跑着的 `healthos-java-pg`）：
+- `tools/smoke/verify_pgvector.py [N]`：库内随机向量，证明 `<=>` 与暴力余弦一致、HNSW 被选中、加速比；
+- `tools/smoke/verify_ann_realsearch.py`：真实 bge-m3 嵌入 + 生产 `searchTopK` SQL 排序正确性。
 
 ### 单测怎么写
 
@@ -1114,3 +1127,40 @@ CJK 按字断行、西文在空格回退、控制字符与代理项替换。要�
     ④ 再重启 → `throttle-after` —— 仍 `429`（失败计数跨重启）。
     另外看 `/health/dependencies` 的 `auth` 字段：`store=jdbc` 才算走了库，
     出现 `jdbc:DEGRADED` 说明已经降级过、跨节点会漏判。
+
+## 8.104 接 cross-encoder 重排（2026-11-05 已落地）
+
+本地检索先用「词面 + 向量」加权和融合（`HybridScorer`），这是双塔思路，分数可解释但语义交叉不足。
+cross-encoder 把 (query, passage) 拼一起过一次模型，直接打"这段回答这问题的程度"，排序质量更好。
+
+### 应用侧已做的抽象
+
+- `spi/retrieval/RetrievalReranker`：重排 SPI，**只重排、可截断，不新增候选之外的文本**。
+- `provider/retrieval/HttpReranker`：调外部 `/rerank` 端点（契约见下），带 1.5s 连接 / 8s 读超时；
+  不可用就 `available()=false`，`rerank()` 任意异常上层退回融合序——**重排是增强不是依赖**。
+- `NoopReranker`：`rerank.enabled=false` 时的占位，永不 `available()`。
+- `LocalKnowledgeBase.retrieve`：重排开启且可用时，融合序先取 `rerank-candidate-limit` 条送重排、
+  按返回分数重排并保留 `rerank-topk` 条；异常退回融合序。覆盖 `local` 与 `hybrid`（后者委托 `local.retrieve`）。
+- 健康姿态：`/health/dependencies` 的 `rerank` 字段 = `disabled` / `ok:http:...` / `unavailable:http:...`。
+
+### 端点契约（`tools/rerank-service/server.py`）
+
+```
+POST {baseUrl}/rerank
+  req : {"query": "...", "passages": ["文本0", "文本1", ...]}
+  resp: {"results": [{"index": 0, "score": 0.92}, ...]}   // index 对应 passages 下标，score 越大越相关
+GET  {baseUrl}/health  -> 200 模型已加载；503 未加载（应用侧据此降级）
+```
+
+### 为什么本机没有现成端点
+
+Ollama 0.40 没有 `/api/rerank`，`bge-reranker-v2-m3` 只能当生成模型跑、拿不到 (query, passage) 分数。
+所以重排服务要自建：`python tools/rerank-service/server.py --stub`（纯标准库打分，验证契约与对照）
+或去掉 `--stub` 走真实模型（从 `HF_ENDPOINT=https://hf-mirror.com` 拉 `BAAI/bge-reranker-v2-m3`）。
+装不上时 `/health` 返回 503，应用自动退回融合序——**不假装有重排**。
+
+### 单测怎么写
+
+- `HttpRerankerTest`：JDK `HttpServer` 起桩，钉住探活 200/503、`/rerank` 解析并按分数降序、`503` 抛异常。
+- `LocalKnowledgeBaseTest`：用假 `RetrievalReranker`，钉住"重排真正改变顺序"与"重排抛异常退回融合序不冒泡"。
+- `tools/smoke/verify_rerank.py`：本地起 stub 服务，演示"融合序排错的强相关段被重排顶到第 1"。

@@ -47,6 +47,8 @@ public class HealthController {
     private final com.kangheng.healthos.service.care.CarePdfRenderer carePdfRenderer;
     private final com.kangheng.healthos.spi.ai.EmbeddingModel embeddingModel;
     private final com.kangheng.healthos.service.auth.SessionRevocationRegistry revocations;
+    private final com.kangheng.healthos.provider.retrieval.PgVectorIndex vectorIndex;
+    private final com.kangheng.healthos.spi.retrieval.RetrievalReranker reranker;
 
     public HealthController(JdbcTemplate jdbcTemplate,
                             ObjectStorage storage,
@@ -59,7 +61,9 @@ public class HealthController {
                             com.kangheng.healthos.service.tracing.TracingService tracing,
                             com.kangheng.healthos.service.care.CarePdfRenderer carePdfRenderer,
                             com.kangheng.healthos.spi.ai.EmbeddingModel embeddingModel,
-                            com.kangheng.healthos.service.auth.SessionRevocationRegistry revocations) {
+                            com.kangheng.healthos.service.auth.SessionRevocationRegistry revocations,
+                            com.kangheng.healthos.provider.retrieval.PgVectorIndex vectorIndex,
+                            com.kangheng.healthos.spi.retrieval.RetrievalReranker reranker) {
         this.jdbcTemplate = jdbcTemplate;
         this.storage = storage;
         this.llmProvider = llmProvider;
@@ -72,6 +76,8 @@ public class HealthController {
         this.carePdfRenderer = carePdfRenderer;
         this.embeddingModel = embeddingModel;
         this.revocations = revocations;
+        this.vectorIndex = vectorIndex;
+        this.reranker = reranker;
     }
 
     @GetMapping("/health")
@@ -110,6 +116,18 @@ public class HealthController {
                     + "(dim=" + embeddingModel.dimension() + ")");
         } else {
             body.put("embedding", "disabled");
+        }
+
+        // 向量索引：装没装 pgvector 决定了检索是走 ANN 还是把整篇向量搬回内存算。
+        // 这不是"健康与否"，但它是"长文档检索慢不慢、准不准"的根因，排障第一眼要看。
+        body.put("vectorIndex", vectorIndex.posture());
+
+        // 重排器：交叉编码器是可选增强。关掉不影响检索（走融合序）；开着但端点挂了要能看见——
+        // 否则"开了重排却没生效"会被当成"重排没用"。available() 对 Noop 立即返回 false，不联网。
+        if (reranker.name().equals("noop")) {
+            body.put("rerank", "disabled");
+        } else {
+            body.put("rerank", (reranker.available() ? "ok" : "unavailable") + ":" + reranker.name());
         }
 
         boolean graphOk = graphService.storeHealthy();

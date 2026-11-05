@@ -219,7 +219,7 @@ POST /api/v1/retrieval                   page_size + similarity_threshold
 
 ## 3. 跑通了什么（实测结果，非声称）
 
-`mvn clean verify`：**526 个单元测试全部通过，BUILD SUCCESS**（66 个测试类）；分层依赖校验 0 违规（87 包 / 326 类 / 932 条跨包引用）。
+`mvn clean verify`：**541 个单元测试全部通过，BUILD SUCCESS**；分层依赖校验 0 违规（87 包 / 331 类 / 941 条跨包引用）。
 
 覆盖：分段 / 二分 / 合并 / 重试策略 / 证据定位 / 令牌 / 检索 / 指标判定 /
 OCR 行重建（6）/ OCR 响应解析（6）/ 扫描件判定与归一化（6）/ 规则抽取（9）/
@@ -845,6 +845,8 @@ Markdown 的关键纪律：**只从已冻结来源取事实**——档案修订�
 | 关键词查询 | 「四君子汤主治什么？」→ 两条路都能答，词面仍是主力 |
 | 降级 | 把 `base-url` 指向死端口：`embedding: ollama:bge-m3:unavailable`、`status: ready`，问答照常返回（走词面），耗时 0.78s |
 | 冷却 | 可重试失败后安静 60s 再试；不可重试（4xx/维度不符）不冷却，因为再试也一样 |
+| **ANN 索引（2026-11-05 落地）** | 镜像换 `pgvector/pgvector:0.8.0-pg16`；`chunk_vector.embedding vector(1024)` + HNSW `ix_chunk_vector_ann`，启动由 `PgVectorIndex` 条件建。`/health/dependencies` → `vectorIndex: pgvector:0.8.0(dim=1024,hnsw)`。检索优先 ANN，空结果退回 Java 全量余弦。`vector-index=off` 可强制关。`verify_pgvector.py` 实测 N=20000 加速 55×、N=200000 加速 739×，top1 精确=ANN |
+| **cross-encoder 重排（2026-11-05 落地）** | 应用侧 `RetrievalReranker` SPI + `HttpReranker`（调自建 `/rerank`）+ 降级。融合序头部 `rerank-candidate-limit=20` 条送重排、保留 `rerank-topk` 条；端点不可用/报错退回融合序，不阻断问答。`rerank.enabled=true` 时 `/health/dependencies` 显示 `rerank: ok/unavailable:http:...`。本机 Ollama 没有 `/api/rerank`，服务用 `tools/rerank-service/server.py`（真实模式拉 `bge-reranker-v2-m3`，`--stub` 无模型跑通契约）；`verify_rerank.py` 验证"融合序排错的强相关段被重排顶到第 1"。**不假装有**：没起服务就只是融合序 |
 
 **融合排序是加权和，不是两段式**：`score = 0.6×向量 + 0.4×词面覆盖率`
 （`healthos.retrieval.vector-weight`）。两段式（向量召回→词面重排）会引入两个不可解释的门槛，
@@ -854,9 +856,12 @@ Markdown 的关键纪律：**只从已冻结来源取事实**——档案修订�
 
 **三处刻意的取舍**：
 
-1. **不装 pgvector**：官方 `postgres:16` 镜像不带该扩展，向量存 JSON 数组、余弦在 Java 侧算。
-   本地候选集只有几十到几百条（`candidate-limit=200`），够用且 `psql` 里能直接读懂。
-   上 pgvector 时把列换成 `vector(1024)` 加 HNSW 索引，只动 `ChunkVectorService` 两句 SQL。
+1. **已上 pgvector（2026-11-05 落地）**：compose 把镜像换成 `pgvector/pgvector:0.8.0-pg16`，
+   `chunk_vector.embedding` 列是 `vector(1024)`，建了 `ix_chunk_vector_ann`（HNSW，`vector_cosine_ops`）。
+   应用启动由 `PgVectorIndex` 探测扩展、条件加列加索引，**扩展缺失或维度不符就降级留痕、不阻断启动**。
+   检索走 `embedding <=> ?::vector` 的 ANN（`vector-index=auto/pgvector/off` 可切），返回空才退回 Java 侧全量余弦。
+   实测（见 `tools/smoke/verify_pgvector.py`）：N=20000 加速 **55×**、N=200000 加速 **739×**，top1 精确与 ANN 一致。
+   仍保留 `chunk_vector.vector`（JSON 文本）作无扩展时的退路列，不删。
 2. **查询时会写库**：历史文档没有向量，首查顺手补建（带 in-flight 去重）。
    让运维「记得跑一次回填」是不可靠的承诺。
 3. **索引期失败不阻断流水线**：`ragflow_index` 节点仍 `SUCCEEDED`，但 detail 里带
@@ -1157,6 +1162,11 @@ RAGFlow 返回的切片没有页码与字符区间，`HybridKnowledgeBase.enrich
 | `HEALTHOS_EMBEDDING_DIM` | `1024` | 维度不符会在每次响应上报错，而不是悄悄入库 |
 | `HEALTHOS_RETRIEVAL_VECTOR_WEIGHT` | `0.6` | 融合排序里向量的权重（0~1） |
 | `HEALTHOS_RETRIEVAL_VECTOR_MIN_SCORE` | `0.45` | 词面完全没命中时，向量分的准入门槛 |
+| `HEALTHOS_RETRIEVAL_VECTOR_INDEX` | `auto` | `auto`（有 pgvector 扩展就走 ANN，否则退回 Java 全量余弦）/ `pgvector`（强制 ANN，索引缺失则降级留痕）/ `off`（强制走内存全量余弦，不碰 `embedding` 列） |
+| `HEALTHOS_RETRIEVAL_RERANK_ENABLED` | `false` | 是否启用 cross-encoder 重排（增强，非依赖）；开启还需 `rerank.url` 指向真端点，否则 `unavailable` 并自动退回融合序 |
+| `HEALTHOS_RETRIEVAL_RERANK_URL` | `http://127.0.0.1:8899` | 重排服务地址（`/rerank` 与 `/health` 两个端点，见 `tools/rerank-service`） |
+| `HEALTHOS_RETRIEVAL_RERANK_CANDIDATE_LIMIT` | `20` | 送重排的融合序候选条数（cross-encoder 比双塔贵，取头部这批即可） |
+| `HEALTHOS_RETRIEVAL_RERANK_TOPK` | `0` | 重排后保留条数；`0` = 沿用 `topK` |
 | `HEALTHOS_RAGFLOW_BASE_URL` | `http://127.0.0.1:9380` | RAGFlow 实例 |
 | `HEALTHOS_RAGFLOW_API_KEY` | 空 | 启用 `ragflow`/`hybrid` 时必填 |
 | `HEALTHOS_RAGFLOW_SIMILARITY_THRESHOLD` | `0.2` | 对齐原工程 preset；低于该分的切片不参与作答 |
@@ -1396,7 +1406,7 @@ java -cp target/classes com.kangheng.healthos.service.auth.PasswordHash '你的�
 | 扫描件 OCR | 百度 Paddle-VL | **已接入并真联调**：`generic`（HTTP multipart）/ `paddle`（hubserving `POST /predict/ocr_system`）两种客户端。`paddle` 已对仓库内**真 PaddleOCR 服务**（PP-OCRv3 / paddle 2.6.2）跑通端到端：上传扫描件 → 202 → 五节点全 SUCCEEDED → **库里 chunk 与识别结果 6/6 行逐字命中**，`/health/dependencies` 报 `ocr: ok` | 原判断「付费服务无法验证」是**误判**：`/predict/ocr_system` + `{images:[base64]}` + `results[0].{text,confidence,text_region}` 是开源自建 hubserving 的形状，不需要账号（百度智能云那套是 `/rest/2.0/ocr/v1/...?access_token=` + `words_result`，代码不是照它写的）。真正没验的只剩百度云商用接口本身 |
 | 知识库 | RAGFlow 外部服务 | **已接入**：`ragflow` / `hybrid`（双写 + 检索降级）；本地模式保留为默认 | RAGFlow 重量级（含 embedding 模型），默认不引入更利于开箱跑通 |
 | 图谱存储 | Neo4j（Cypher） | **已接入**：`neo4j` / `dual`（PG 权威 + Neo4j 图查询 + 熔断降级） | 保留 PG 作权威存储，避免主链路被图库可用性绑死 |
-| 向量检索 / 重排 | **也不在后端**：全部交给 RAGFlow Chat 的 preset（`similarity_threshold=0.2`、`keywords_similarity_weight=0.3`、`top_n=8`、`rerank_model` 默认空） | **参数已对齐并透传**：`/api/v1/retrieval` 带 `similarity_threshold`、`vector_similarity_weight`、`rerank_id`（实测 stub 收到 `threshold=0.2 keywords_weight=0.3`）。**本地检索已具备向量能力**：`bge-m3`（Ollama，1024 维）+ `chunk_vector` 表，与词面按 `0.6/0.4` 加权融合（见 §3.21）；同义查询实测由「0 条」变「2 条」。**差在**：无 ANN 索引（候选集小，Java 侧算余弦）、**无 cross-encoder 重排**——本机 Ollama 0.40 没有 `/api/rerank`，`bge-reranker-v2-m3` 只能当生成模型跑，拿不到分数；要真重排得起 llama.cpp server 或走 RAGFlow 的 `rerank_id` | 原工程后端并未使用 pgvector（`grep` 全文 0 命中），此前把它写成"源工程用 pgvector"是我的误判，已更正。重排的"融合"与"交叉编码器"是两件事：前者已在本地做，后者需要真的 rerank 端点，没端点就不假装有 |
+| 向量检索 / 重排 | **也不在后端**：全部交给 RAGFlow Chat 的 preset（`similarity_threshold=0.2`、`keywords_similarity_weight=0.3`、`top_n=8`、`rerank_model` 默认空） | **参数已对齐并透传**：`/api/v1/retrieval` 带 `similarity_threshold`、`vector_similarity_weight`、`rerank_id`（实测 stub 收到 `threshold=0.2 keywords_weight=0.3`）。**本地检索已具备向量能力**：`bge-m3`（Ollama，1024 维）+ `chunk_vector` 表，与词面按 `0.6/0.4` 加权融合（见 §3.21）；同义查询实测由「0 条」变「2 条」。**差在**：**ANN 索引已补**（`chunk_vector.embedding vector(1024)` + HNSW，见 §3.21、§11）、**cross-encoder 重排已支持**（需自建 `/rerank` 端点，Ollama 不支持，见 `tools/rerank-service` 与 §11，应用侧已留降级） | 原工程后端并未使用 pgvector（`grep` 全文 0 命中），此前把它写成"源工程用 pgvector"是我的误判，已更正。重排的"融合"与"交叉编码器"是两件事：前者在本地做、后者需要真的 rerank 端点，没端点就不假装有 |
 | 问答路径 | 三路并行（`ragflow`/`modern`/`tcm`）+ `summary`，带节点级租约、心跳、断点续跑 | **三路并行 + 汇总已实现**（`AnswerBranch` SPI + `BranchOrchestrator`，错误码同名 `QA_BRANCHES_INCOMPLETE`）；**持久化 run + 断点续跑已实现**（`qa_run` / `qa_run_node` / `qa_event` / `qa_attempt` 四表，逐节点落库、失败节点单独重跑、汇总节点跟着重跑、事件流按 `seq` 断点续传、SSE 订阅，见 §3.9）。**差在**：无真正的租约与心跳（认领靠 Outbox 的 `FOR UPDATE SKIP LOCKED`，不是节点级租约），续跑靠"整轮重放"而非跨进程接管在途节点，`modern` 路只做患者指标、不含"模型常识"那半边 | 单机单次请求内编排，延迟可预测；医疗场景下"模型常识"这条路本来就该慎用 |
 | 观测 / Tracing | `tracing_*` 一整套（业务投影、导出、保留策略、ClickHouse 诊断） | **已实现核心**：`trace_run` / `trace_span` / `trace_event` 三表 + W3C 风格 traceId/spanId + span 树 + OTLP/JSON 导出 + 按 `expires_at` 的保留清理 + p50/p95 总览。**差在**：无 ClickHouse 列存与跨服务采样决策，`parent` 关系靠线程内 `ThreadLocal` 搬运而非 W3C `traceparent` 头（跨进程会断链） | 单机切片先要"能自己看自己"；埋点若一开始就依赖外部 Collector，跑通成本会盖过业务本身 |
 | 患者域范围 | 建档 / 批次导入 / 草稿 / 删除台账 / 孤儿回收 / 对象清单 / 资料录入 等十余模块 | **已实现主干**：`DRAFT→ACTIVE⇄ARCHIVED→DELETED` 状态机、乐观锁修订（`revision` + 409 冲突）、修订快照、CSV/JSON 批次导入（逐行独立事务 + sha256 幂等 + 按 `external_ref` upsert）、对象清单与附件、孤儿扫描/点名清理、删除四段式（预览令牌 → 确认 → 异步擦除 → 台账 `sha256` 可回读验证）、**资料录入链路**（上传 → OCR 归一化 → 分片抽取 → 两道人工核查 → 人工补录 → 生成档案，见 §3.8）、**按归属人隔离（owner 逐表过滤，越权 404）**。**已补**：资料录入审阅草稿 `patient_review_draft`（`basic` / `clinical` 两个 scope，`baseRevision` + `expectedVersion` 双锁，服务端暂存不改正式修订，见 §3.20）。**差在**：无字段级加密与留存期策略、无"法律冻结"、批次不处理跨行裸换行、录入抽取目前只覆盖 13 项常用指标与 6 个基础字段（不含结构化报告模板） | 删除与台账涉及合规，宁可做完整链路也不做半套；加密与冻结依赖 KMS 与法务规则，非本切片可拍板 |
@@ -1499,13 +1509,20 @@ java -cp target/classes com.kangheng.healthos.service.auth.PasswordHash '你的�
   问答不中断，但要重新上传文档才会重建 RAGFlow 索引——它是契约验证工具，不是持久化知识库。
 - `hybrid` / `dual` 只保证「外部失败不影响主链路」，**不保证两侧数据强一致**：
   外部写失败只记 `note`，没有对账与补偿任务。
-- **向量检索没有 ANN 索引**：全量取本文档的切片向量在 Java 侧算余弦，候选上限
-  `candidate-limit=200`。万级切片要换 pgvector（`vector(1024)` + HNSW）或独立向量库，
-  替换点在 `ChunkVectorService` 的两句 SQL，接口不动。
-- **没有 cross-encoder 重排**：本地做的是「向量分 + 词面覆盖率」的加权融合，不是
-  reranker 对 (query, passage) 逐对打分。本机 Ollama 0.40 没有 `/api/rerank`，
-  `bge-reranker-v2-m3` 只有 `completion` 能力、拿不到分数；要真重排得起 llama.cpp server
-  或走 RAGFlow 的 `rerank_id`。
+- **向量检索的 ANN 索引（已解决，2026-11-05）**：`chunk_vector.embedding vector(1024)` + HNSW
+  索引 `ix_chunk_vector_ann` 已在启动期由 `PgVectorIndex` 条件建立；检索优先走 `embedding <=> ?::vector`
+  的 ANN，返回空才退回 Java 侧全量余弦。`vector-index=auto/pgvector/off` 可切。
+  实测见 `tools/smoke/verify_pgvector.py`（N=20000 加速 55×、N=200000 加速 739×，top1 精确=ANN）
+  与 `verify_ann_realsearch.py`（真实 bge-m3 嵌入 + 生产余弦 SQL 排序正确）。
+  扩展缺失或维度不符自动降级留痕（`degraded:...`），不阻断启动。
+- **cross-encoder 重排（已支持，需自建端点，2026-11-05）**：应用侧已落地 `RetrievalReranker` SPI
+  + `HttpReranker`（调 `/rerank`）+ 降级（端点不可用/报错退回融合序，不阻断问答），由
+  `healthos.retrieval.rerank.enabled` + `rerank.url` 开关，融合序头部 `rerank-candidate-limit`
+  条送重排、保留 `rerank-topK` 条。`/health/dependencies` 的 `rerank` 字段显示
+  `disabled` / `ok:http:...` / `unavailable:http:...`。**本机 Ollama 0.40 没有 `/api/rerank`、
+  `bge-reranker-v2-m3` 只能当生成模型跑**——所以重排服务要自建：`tools/rerank-service/server.py`
+  （`--stub` 无模型跑通契约；真实模式从 `hf-mirror.com` 拉 `BAAI/bge-reranker-v2-m3`，装不上时
+  `/health` 返回 503、应用自动降级）。不假装有重排：没起服务就只是融合序，分数照样可解释。
 - **融合权重是按小样本调的**：`vector-weight=0.6`、`vector-min-score=0.45` 是在
   bge-m3 + 中医典籍切片上试出来的，换模型或换语料要重调；调的依据是"同义查询召回
   与无关查询误召"这两组对照，不是看分数高不高。

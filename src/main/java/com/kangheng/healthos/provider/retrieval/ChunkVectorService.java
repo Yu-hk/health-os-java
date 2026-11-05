@@ -19,11 +19,13 @@ import com.kangheng.healthos.mapper.classics.DocumentChunkMapper;
 import com.kangheng.healthos.mapper.retrieval.ChunkVectorMapper;
 import com.kangheng.healthos.model.classics.DocumentChunkEntity;
 import com.kangheng.healthos.model.retrieval.ChunkVectorEntity;
+import com.kangheng.healthos.model.retrieval.ChunkVectorScore;
 import com.kangheng.healthos.spi.ai.EmbeddingException;
 import com.kangheng.healthos.spi.ai.EmbeddingModel;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
 import org.springframework.stereotype.Service;
 
 /**
@@ -32,8 +34,13 @@ import org.springframework.stereotype.Service;
  * <p>两个入口，一个目的：
  * <ul>
  *   <li>{@link #indexDocument} —— 索引期（流水线 index 节点）把整篇切片向量化；</li>
- *   <li>{@link #search} —— 检索期把问题向量化，和库里每条切片算余弦。</li>
+ *   <li>{@link #search} —— 检索期把问题向量化，取回本文档最相近的切片。</li>
  * </ul>
+ *
+ * <p><b>两条检索路径，一份语义</b>：库里有 pgvector 就走 ANN（{@code ORDER BY embedding <=> q LIMIT n}），
+ * 否则把整篇的 JSON 向量取回内存在 Java 侧算余弦。两条路返回的都是 cosine 相似度、
+ * 都截断到 {@code [0,1]}，所以融合排序不需要知道分数是怎么来的。
+ * 差异只在"单次检索要搬多少数据"：ANN 只搬 top-N，另一条要搬全文档的向量。
  *
  * <p><b>降级是这里的核心语义</b>：Ollama 挂了不能让索引失败，也不能让问答失败。
  * 索引期失败写 {@code note} 上报（流水线节点 detail 里能看到），检索期失败返回空
@@ -55,6 +62,7 @@ public class ChunkVectorService {
     private final ChunkVectorMapper vectorMapper;
     private final DocumentChunkMapper chunkMapper;
     private final EmbeddingModel embedding;
+    private final PgVectorIndex index;
     private final HealthOsProperties.Retrieval config;
 
     /** 正在补建向量的文档，避免并发首查重复计算。 */
@@ -64,10 +72,12 @@ public class ChunkVectorService {
     public ChunkVectorService(ChunkVectorMapper vectorMapper,
                               DocumentChunkMapper chunkMapper,
                               EmbeddingModel embedding,
+                              PgVectorIndex index,
                               HealthOsProperties properties) {
         this.vectorMapper = vectorMapper;
         this.chunkMapper = chunkMapper;
         this.embedding = embedding;
+        this.index = index;
         this.config = properties.getRetrieval();
     }
 
@@ -81,6 +91,15 @@ public class ChunkVectorService {
 
     public int dimension() {
         return embedding.dimension();
+    }
+
+    /** 当前是否走 ANN 索引；健康检查与流水线 detail 用它说明"检索是怎么走的"。 */
+    public boolean annEnabled() {
+        return index != null && index.available();
+    }
+
+    public String indexPosture() {
+        return index == null ? "disabled:none" : index.posture();
     }
 
     /**
@@ -103,12 +122,17 @@ public class ChunkVectorService {
         for (ChunkVectorEntity row : vectorMapper.listByDocument(documentId, embedding.id())) {
             existing.put(row.getChunkId(), row);
         }
+        // 有文本向量但没有定长向量的行也必须重写，否则它们永远进不了 ANN 查询
+        Set<String> missingEmbedding = annEnabled()
+                ? new HashSet<>(vectorMapper.listMissingEmbedding(documentId, embedding.id()))
+                : Set.of();
         Set<String> currentIds = new HashSet<>();
         List<DocumentChunkEntity> todo = new ArrayList<>();
         for (DocumentChunkEntity chunk : chunks) {
             currentIds.add(chunk.getId());
             ChunkVectorEntity row = existing.get(chunk.getId());
-            if (row == null || !Ids.sha256Hex(chunk.getContent()).equals(row.getContentHash())) {
+            boolean stale = row == null || !Ids.sha256Hex(chunk.getContent()).equals(row.getContentHash());
+            if (stale || missingEmbedding.contains(chunk.getId())) {
                 todo.add(chunk);
             }
         }
@@ -136,15 +160,11 @@ public class ChunkVectorService {
                 row.setVector(Json.write(vectors.get(i)));
                 row.setContentHash(Ids.sha256Hex(chunk.getContent()));
                 row.setCreatedAt(now);
-                // 唯一键 (chunk_id, model) 保证重放不会写出两行
-                vectorMapper.delete(new LambdaQueryWrapper<ChunkVectorEntity>()
-                        .eq(ChunkVectorEntity::getChunkId, chunk.getId())
-                        .eq(ChunkVectorEntity::getModel, embedding.id()));
-                vectorMapper.insert(row);
+                write(row);
             }
             blockedUntil.set(0);
-            log.info("切片向量已建立 documentId={} model={} 写入={}/{}", documentId, embedding.id(),
-                    todo.size(), chunks.size());
+            log.info("切片向量已建立 documentId={} model={} 写入={}/{} ann={}", documentId, embedding.id(),
+                    todo.size(), chunks.size(), annEnabled());
             return new Stats(todo.size(), chunks.size(), embedding.id(), null);
         } catch (EmbeddingException ex) {
             block(ex);
@@ -159,7 +179,31 @@ public class ChunkVectorService {
     }
 
     /**
-     * 问题与本文档各切片的余弦相似度。
+     * 落一行。ANN 可用时同时写定长向量列；写失败就降级回纯文本路径，
+     * 而不是让整篇文档索引失败。
+     */
+    private void write(ChunkVectorEntity row) {
+        if (annEnabled()) {
+            try {
+                vectorMapper.upsertWithEmbedding(row);
+                return;
+            } catch (DataAccessException ex) {
+                // 典型原因：维度与列定义不符、扩展被卸掉。降级总比整篇索引失败好
+                index.degrade("write_failed:" + dbReason(ex));
+            }
+        }
+        // 唯一键 (chunk_id, model) 保证重放不会写出两行
+        vectorMapper.delete(new LambdaQueryWrapper<ChunkVectorEntity>()
+                .eq(ChunkVectorEntity::getChunkId, row.getChunkId())
+                .eq(ChunkVectorEntity::getModel, row.getModel()));
+        vectorMapper.insert(row);
+    }
+
+    /**
+     * 问题与本文档各切片的余弦相似度，取最相近的前 {@code limit} 条。
+     *
+     * <p>返回条数上限是 {@code limit} 而不是全部切片：pgvector 路径本来就只有 top-N，
+     * 两条路径必须给出同一形状的结果，否则"召回变好了还是变差了"没法比较。
      *
      * @return chunkId → [0,1]；未启用、未索引、上游失败均返回空映射（调用方退回词面打分）
      */
@@ -170,11 +214,12 @@ public class ChunkVectorService {
         if (System.currentTimeMillis() < blockedUntil.get()) {
             return Map.of();
         }
-        List<ChunkVectorEntity> rows = vectorMapper.listByDocument(documentId, embedding.id());
-        if (rows.isEmpty() && ensureBackfill(documentId)) {
+        boolean ann = annEnabled();
+        List<ChunkVectorEntity> rows = ann ? List.of() : vectorMapper.listByDocument(documentId, embedding.id());
+        if (!ann && rows.isEmpty() && ensureBackfill(documentId)) {
             rows = vectorMapper.listByDocument(documentId, embedding.id());
         }
-        if (rows.isEmpty()) {
+        if (!ann && rows.isEmpty()) {
             return Map.of();
         }
         float[] query;
@@ -188,6 +233,39 @@ public class ChunkVectorService {
         if (query.length == 0) {
             return Map.of();
         }
+        if (ann) {
+            Map<String, Double> result = searchByIndex(documentId, query, limit);
+            if (!result.isEmpty()) {
+                return result;
+            }
+            // ANN 空结果（历史行还没回填定长向量）时退回全量，别让"索引晚于数据"变成"检索没结果"
+            rows = vectorMapper.listByDocument(documentId, embedding.id());
+            if (rows.isEmpty() && ensureBackfill(documentId)) {
+                rows = vectorMapper.listByDocument(documentId, embedding.id());
+            }
+        }
+        return cosineInMemory(query, rows, documentId);
+    }
+
+    private Map<String, Double> searchByIndex(String documentId, float[] query, int limit) {
+        try {
+            List<ChunkVectorScore> hits = vectorMapper.searchTopK(documentId, embedding.id(),
+                    Json.write(query), Math.max(1, limit));
+            Map<String, Double> scores = new HashMap<>(hits.size());
+            for (ChunkVectorScore hit : hits) {
+                if (hit.getScore() == null) {
+                    continue;
+                }
+                scores.put(hit.getChunkId(), clamp(hit.getScore()));
+            }
+            return scores;
+        } catch (DataAccessException ex) {
+            index.degrade("query_failed:" + dbReason(ex));
+            return Map.of();
+        }
+    }
+
+    private Map<String, Double> cosineInMemory(float[] query, List<ChunkVectorEntity> rows, String documentId) {
         Map<String, Double> scores = new HashMap<>(rows.size());
         int skipped = 0;
         for (ChunkVectorEntity row : rows) {
@@ -203,13 +281,26 @@ public class ChunkVectorService {
                 skipped++;
                 continue;
             }
-            double cosine = EmbeddingModel.cosine(query, vector);
-            scores.put(row.getChunkId(), Math.max(0d, Math.min(1d, cosine)));
+            scores.put(row.getChunkId(), clamp(EmbeddingModel.cosine(query, vector)));
         }
         if (skipped > 0) {
             log.debug("检索时跳过 {} 条维度不符/损坏的向量 documentId={}", skipped, documentId);
         }
         return scores;
+    }
+
+    private static double clamp(double cosine) {
+        return Math.max(0d, Math.min(1d, cosine));
+    }
+
+    /** 从 DataAccessException 里取一句能写进降级原因的话；异常 mock 掉 getMostSpecificCause 时也不崩。 */
+    private static String dbReason(DataAccessException ex) {
+        Throwable cause = ex.getMostSpecificCause();
+        if (cause == null) {
+            cause = ex;
+        }
+        String message = cause.getMessage();
+        return message == null ? cause.getClass().getSimpleName() : message;
     }
 
     /** 历史文档首次被检索时补建向量；同一文档并发首查只让一路去算。 */
