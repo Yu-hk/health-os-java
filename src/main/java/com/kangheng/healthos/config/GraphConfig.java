@@ -7,7 +7,9 @@ import com.kangheng.healthos.provider.graph.DualGraphStore;
 import com.kangheng.healthos.spi.graph.GraphStore;
 import com.kangheng.healthos.provider.graph.JdbcGraphStore;
 import com.kangheng.healthos.provider.graph.Neo4jGraphStore;
-import lombok.extern.slf4j.Slf4j;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -19,9 +21,10 @@ import org.springframework.util.StringUtils;
  * <p>Neo4j 的 driver 只有在 {@code store=neo4j|dual} 时才会被创建。
  * 这一点很重要：默认的 local 部署不该因为"装了个没配密码的 Neo4j 客户端"而启动失败。
  */
-@Slf4j
 @Configuration
 public class GraphConfig {
+
+    private static final Logger log = LoggerFactory.getLogger(GraphConfig.class);
 
     @Bean
     public GraphStore graphStore(HealthOsProperties properties,
