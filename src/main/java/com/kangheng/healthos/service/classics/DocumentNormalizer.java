@@ -2,20 +2,30 @@ package com.kangheng.healthos.service.classics;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import com.kangheng.healthos.common.BizException;
 import com.kangheng.healthos.config.HealthOsProperties;
-import com.kangheng.healthos.spi.ocr.OcrException;
-import com.kangheng.healthos.spi.ocr.OcrProvider;
 import com.kangheng.healthos.model.ocr.OcrResult;
 import com.kangheng.healthos.service.ocr.OcrTextAssembler;
 import com.kangheng.healthos.service.ocr.PdfPageRenderer;
 import com.kangheng.healthos.service.tracing.TracingService;
+import com.kangheng.healthos.spi.ocr.OcrException;
+import com.kangheng.healthos.spi.ocr.OcrProvider;
 
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDResources;
+import org.apache.pdfbox.pdmodel.graphics.PDXObject;
+import org.apache.pdfbox.pdmodel.graphics.form.PDFormXObject;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,16 +35,21 @@ import org.springframework.util.StringUtils;
 /**
  * 文档归一化：把上传内容转成统一 markdown，并在 PDF 页间插入换页符供页码回溯。
  *
- * <p>三条分支，与源工程 {@code normalize_or_ocr} 节点对齐：
+ * <p>PDF 有四种结果，与原工程 {@code normalize_or_ocr} 节点对齐但判定更细：
  * <ol>
- *   <li><b>文本层可用</b>：直接用 PDFBox 抽取，最快且无损；</li>
- *   <li><b>扫描件 / 图片</b>：PDF 逐页渲染或图片直接送 OCR；</li>
- *   <li><b>纯文本</b>：原样接收。</li>
+ *   <li><b>pdf-text</b>：逐页文本层都达标，直接用 PDFBox 抽取，最快且无损；</li>
+ *   <li><b>pdf-ocr</b>：整篇都没有可信文本层（扫描件）或 {@code mode=ocr} 强制重扫，逐页 OCR；</li>
+ *   <li><b>pdf-mixed</b>：混合 PDF，达标页保留 PDFBox 文本，只把不达标页送 OCR，按原页码合并；</li>
+ *   <li><b>image-ocr / text</b>：图片直接识别、纯文本原样接收。</li>
  * </ol>
  *
- * <p>判定"是否扫描件"用的是<b>有效字符数下限</b>而不是"有无文本"：很多扫描 PDF
- * 带一层由扫描软件生成的空文本或极短乱码层，只判断存在性会走进错误分支，
- * 抽出一份看起来正常、实际无内容的文档。
+ * <p><b>为什么必须逐页判定</b>：早期实现把整篇文本拼成一个字符串、总数 ≥20 就走文本层。
+ * 于是"前几页正文 + 后几页扫描图"会因总数达标而漏掉扫描页；反过来 10 页扫描件每页
+ * 只有"第1页"三个字也能凑够 20 字。原工程 {@code document_ocr.py} 的做法是逐页算
+ * 非空白字符、{@code all(页达标)} 收口，并用 {@code page.images} 判断低文本页是不是扫描页，
+ * 这里沿用同一思路：{@link #pageUsable} + {@link #hasImages}。
+ *
+ * <p>有效字符只数汉字 / 字母 / 数字：页码、水印、标点、控制字符都不该被当作"正文存在"的证据。
  */
 @Component
 public class DocumentNormalizer {
@@ -42,6 +57,9 @@ public class DocumentNormalizer {
     private static final Logger log = LoggerFactory.getLogger(DocumentNormalizer.class);
 
     private static final char PAGE_BREAK = '\f';
+
+    /** Form XObject 允许递归查找图像的层数，防止畸形 PDF 造成深递归。 */
+    private static final int MAX_XOBJECT_DEPTH = 3;
 
     private final OcrProvider ocrProvider;
     private final PdfPageRenderer pageRenderer;
@@ -59,8 +77,8 @@ public class DocumentNormalizer {
     }
 
     /**
-     * @param sourceKind text / pdf-text / pdf-ocr / image-ocr
-     * @param engine     文本来源引擎（pdfbox 或 OCR 实现名），写入流水线 detail 便于追溯
+     * @param sourceKind text / pdf-text / pdf-ocr / pdf-mixed / image-ocr
+     * @param engine     文本来源引擎（pdfbox、OCR 实现名，或混合时的 pdfbox+OCR），写入流水线 detail
      * @param ocrPages   实际跑过 OCR 的页数，0 表示未走 OCR
      */
     public record Normalized(String markdown, String sourceKind, int pageCount, String engine, int ocrPages) {
@@ -74,7 +92,8 @@ public class DocumentNormalizer {
         }
     }
 
-    private record TextLayer(String text, int pages) {
+    /** 单页文本层快照：页码（1-based）、抽取文本、有效字符数、页面是否含图像。 */
+    private record PageText(int pageNumber, String text, int effective, boolean hasImages) {
     }
 
     public Normalized normalize(byte[] content, String contentType, String filename) {
@@ -117,66 +136,160 @@ public class DocumentNormalizer {
     // ---------------------------------------------------------------- PDF
 
     private Normalized normalizePdf(byte[] content) {
-        TextLayer layer = extractTextLayer(content);
-        int effective = effectiveChars(layer.text());
-        if (effective >= properties.getOcr().getTextLayerMinChars()) {
-            return new Normalized(layer.text(), "pdf-text", layer.pages(), "pdfbox", 0);
+        HealthOsProperties.Ocr config = properties.getOcr();
+        String mode = modeOf(config);
+        List<PageText> pages = extractPages(content);
+        int total = pages.stream().mapToInt(PageText::effective).sum();
+        boolean wholeSparse = total < config.getTextLayerMinChars();
+        List<PageText> weak = pages.stream().filter(page -> !pageUsable(page, config)).toList();
+        boolean usable = !wholeSparse && weak.isEmpty();
+
+        if (usable && !"ocr".equals(mode)) {
+            return new Normalized(joinText(pages.stream().map(PageText::text).toList()),
+                    "pdf-text", pages.size(), "pdfbox", 0);
         }
-        log.info("PDF 文本层有效字符 {} < 阈值 {}，判定为扫描件，转 OCR pages={}",
-                effective, properties.getOcr().getTextLayerMinChars(), layer.pages());
-        return normalizeScannedPdf(content, layer.pages());
+        if ("text".equals(mode)) {
+            throw BizException.badRequest("PDF 文本层不足（共 " + pages.size() + " 页，整篇有效字符 "
+                    + total + "，未达标页 " + pageNumbers(weak) + "，每页下限 "
+                    + config.getTextLayerMinCharsPerPage() + "），当前 mode=text 不允许降级 OCR。"
+                    + "请改用 mode=auto 补 OCR，或 mode=ocr 整篇重扫");
+        }
+        if (usable) {
+            log.info("mode=ocr 强制整篇重扫 pages={}（文本层本可用，整篇有效字符 {}）", pages.size(), total);
+        } else {
+            log.info("PDF 文本层不可全信 pages={} totalChars={} weakPages={} perPageMin={} mode={}",
+                    pages.size(), total, pageNumbers(weak),
+                    config.getTextLayerMinCharsPerPage(), mode);
+        }
+        return normalizeWithOcr(content, pages, "ocr".equals(mode), wholeSparse, config);
     }
 
-    private TextLayer extractTextLayer(byte[] content) {
+    /**
+     * 把 PDF 逐页抽成文本层快照，同时记录该页是否含图像对象。
+     *
+     * <p>保留页级结构是关键：只保留一个拼接字符串的话，后面就无法知道"哪几页不可信"。
+     */
+    private List<PageText> extractPages(byte[] content) {
         try (PDDocument document = Loader.loadPDF(content)) {
             PDFTextStripper stripper = new PDFTextStripper();
-            StringBuilder markdown = new StringBuilder();
-            int pages = document.getNumberOfPages();
-            for (int page = 1; page <= pages; page++) {
+            int pageCount = document.getNumberOfPages();
+            List<PageText> pages = new ArrayList<>(pageCount);
+            for (int page = 1; page <= pageCount; page++) {
                 stripper.setStartPage(page);
                 stripper.setEndPage(page);
-                markdown.append(stripper.getText(document));
-                if (page < pages) {
-                    markdown.append('\n').append(PAGE_BREAK).append('\n');
-                }
+                String text = stripper.getText(document).strip();
+                pages.add(new PageText(page, text, effectiveChars(text),
+                        hasImages(document.getPage(page - 1).getResources(), 0)));
             }
-            return new TextLayer(markdown.toString().strip(), pages);
+            return pages;
         } catch (IOException ex) {
             throw BizException.badRequest("PDF 解析失败: " + ex.getMessage());
         }
     }
 
-    private Normalized normalizeScannedPdf(byte[] content, int pageCount) {
+    /** 单页文本层是否可信：字数够，或者被显式允许且确实没有图像（书名页 / 空白分隔页）。 */
+    private static boolean pageUsable(PageText page, HealthOsProperties.Ocr config) {
+        if (page.effective() >= config.getTextLayerMinCharsPerPage()) {
+            return true;
+        }
+        return config.isAllowSparseTextPages() && !page.hasImages();
+    }
+
+    /** 页面是否含图像 XObject；Form XObject 内嵌的图也有限递归查一层。 */
+    private static boolean hasImages(PDResources resources, int depth) {
+        if (resources == null || depth > MAX_XOBJECT_DEPTH) {
+            return false;
+        }
+        for (COSName name : resources.getXObjectNames()) {
+            PDXObject xobject;
+            try {
+                xobject = resources.getXObject(name);
+            } catch (IOException ex) {
+                log.warn("读取 PDF XObject 失败 name={}: {}", name.getName(), ex.getMessage());
+                continue;
+            }
+            if (xobject instanceof PDImageXObject) {
+                return true;
+            }
+            if (xobject instanceof PDFormXObject form
+                    && hasImages(form.getResources(), depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 对不达标页（或强制时的全部页）逐页 OCR，再按原页码与文本层合并。
+     *
+     * <p>两条防漏页规则：含图像的页 OCR 结果为空时整篇失败，不交出"看起来完整实际缺页"的正文；
+     * 无图且 OCR 没有带来增量的页（空白分隔页 / 短标题页）保留无损 PDFBox 文本，不做无谓降质。
+     */
+    private Normalized normalizeWithOcr(byte[] content, List<PageText> pages,
+                                        boolean forceAll, boolean wholeSparse,
+                                        HealthOsProperties.Ocr config) {
+        Set<Integer> ocrPageNumbers = new LinkedHashSet<>();
+        for (PageText page : pages) {
+            if (forceAll || wholeSparse || !pageUsable(page, config)) {
+                ocrPageNumbers.add(page.pageNumber());
+            }
+        }
+        if (ocrPageNumbers.isEmpty()) {
+            throw new IllegalStateException("文本层判定为不可用，却没有选出需要 OCR 的页");
+        }
         if (!ocrProvider.enabled()) {
-            throw BizException.badRequest(
-                    "PDF 没有可用的文本层（共 " + pageCount + " 页，疑似扫描件），且当前未启用 OCR。"
-                            + "请配置 HEALTHOS_OCR_PROVIDER 与 HEALTHOS_OCR_BASE_URL 后重试，或先转成文本再上传");
+            throw BizException.badRequest("PDF 文本层不足（共 " + pages.size() + " 页，需 OCR 的页："
+                    + ocrPageNumbers + "，疑似扫描件或混合 PDF），且当前未启用 OCR。"
+                    + "请配置 HEALTHOS_OCR_PROVIDER 与 HEALTHOS_OCR_BASE_URL 后重试，或先转成文本再上传");
         }
-        List<PdfPageRenderer.PageImage> images = pageRenderer.render(content);
-        StringBuilder markdown = new StringBuilder();
-        int recognizedPages = 0;
-        int emptyPages = 0;
-        for (int i = 0; i < images.size(); i++) {
-            PdfPageRenderer.PageImage image = images.get(i);
-            String pageText = recognizePage(image);
-            if (pageText.isBlank()) {
-                emptyPages++;
-            } else {
-                recognizedPages++;
+
+        Map<Integer, String> recognizedByPage = new HashMap<>();
+        for (PdfPageRenderer.PageImage image : pageRenderer.render(content, ocrPageNumbers)) {
+            recognizedByPage.put(image.pageNumber(), recognizePage(image));
+        }
+
+        List<String> merged = new ArrayList<>(pages.size());
+        int ocrChars = 0;
+        for (PageText page : pages) {
+            if (!ocrPageNumbers.contains(page.pageNumber())) {
+                merged.add(page.text());
+                continue;
             }
-            markdown.append(pageText);
-            if (i < images.size() - 1) {
-                markdown.append('\n').append(PAGE_BREAK).append('\n');
+            String recognized = recognizedByPage.getOrDefault(page.pageNumber(), "");
+            int recognizedChars = effectiveChars(recognized);
+            if (page.hasImages() && recognizedChars == 0) {
+                throw BizException.badRequest("第 " + page.pageNumber()
+                        + " 页含图像，但 OCR 未识别出任何文字；为避免交出缺页正文，整篇判定为失败。"
+                        + "请检查扫描清晰度或 OCR 服务");
             }
+            if (!forceAll && !page.hasImages() && recognizedChars <= page.effective()) {
+                log.debug("第 {} 页 OCR 无增量（{} <= {}），保留 PDFBox 文本层",
+                        page.pageNumber(), recognizedChars, page.effective());
+                merged.add(page.text());
+                continue;
+            }
+            ocrChars += recognizedChars;
+            merged.add(recognized.strip());
         }
-        String text = markdown.toString().strip();
-        if (effectiveChars(text) == 0) {
-            throw BizException.badRequest("OCR 未从该 PDF 识别出任何文本（" + images.size()
-                    + " 页全部为空）。请检查扫描清晰度或 OCR 服务是否正常");
+
+        if ((forceAll || wholeSparse) && ocrChars < config.getOcrMinResultChars()) {
+            throw BizException.badRequest("OCR 结果有效字符 " + ocrChars + " < 下限 "
+                    + config.getOcrMinResultChars() + "（" + ocrPageNumbers.size()
+                    + " 页）。请检查扫描清晰度或 OCR 服务是否正常");
         }
-        log.info("扫描件 OCR 完成 pages={} recognized={} empty={} engine={}",
-                images.size(), recognizedPages, emptyPages, ocrProvider.name());
-        return new Normalized(text, "pdf-ocr", images.size(), ocrProvider.name(), images.size());
+        String text = joinText(merged);
+        if (effectiveChars(text) < config.getTextLayerMinChars()) {
+            throw BizException.badRequest("归一化后正文有效字符不足 "
+                    + config.getTextLayerMinChars() + "（共 " + pages.size() + " 页），疑似空文档或乱码文本层");
+        }
+
+        boolean mixed = ocrPageNumbers.size() < pages.size();
+        String sourceKind = mixed ? "pdf-mixed" : "pdf-ocr";
+        String engine = mixed ? "pdfbox+" + ocrProvider.name() : ocrProvider.name();
+        log.info("PDF 归一化完成 pages={} textPages={} ocrPages={} ocrChars={} engine={} sourceKind={}",
+                pages.size(), pages.size() - ocrPageNumbers.size(),
+                ocrPageNumbers.size(), ocrChars, engine, sourceKind);
+        return new Normalized(text, sourceKind, pages.size(), engine, ocrPageNumbers.size());
     }
 
     // ---------------------------------------------------------------- 图片
@@ -187,8 +300,10 @@ public class DocumentNormalizer {
         }
         OcrResult result = recognizeWithRetry(content, contentType, "图片");
         String text = OcrTextAssembler.assemble(result.lines());
-        if (text.isBlank()) {
-            throw BizException.badRequest("OCR 未从该图片识别出任何文本，请检查图片清晰度或 OCR 服务");
+        HealthOsProperties.Ocr config = properties.getOcr();
+        if (effectiveChars(text) < config.getOcrMinResultChars()) {
+            throw BizException.badRequest("OCR 从该图片识别出的有效字符不足 "
+                    + config.getOcrMinResultChars() + "，请检查图片清晰度或 OCR 服务");
         }
         return new Normalized(text, "image-ocr", 1, ocrProvider.name(), 1);
     }
@@ -234,18 +349,40 @@ public class DocumentNormalizer {
 
     // ---------------------------------------------------------------- 工具
 
-    /** 有效字符数：剔除分页符与空白后的长度。用于区分"真空文档"与"只有一层空文本"。 */
+    /**
+     * 有效字符数：只统计汉字 / 字母 / 数字（按 Unicode code point，兼容扩展汉字）。
+     *
+     * <p>早期实现只去掉空白，于是页码"第1页"、水印、乱码控制符都被算作正文，
+     * 页数越多越容易把扫描件误判成文本 PDF。
+     */
     static int effectiveChars(String text) {
         if (!StringUtils.hasText(text)) {
             return 0;
         }
-        int count = 0;
-        for (char ch : text.toCharArray()) {
-            if (ch == PAGE_BREAK || Character.isWhitespace(ch) || ch == '\u3000') {
-                continue;
-            }
-            count++;
+        return (int) text.codePoints().filter(cp -> Character.isLetterOrDigit(cp)).count();
+    }
+
+    private static String modeOf(HealthOsProperties.Ocr config) {
+        String mode = config.getMode() == null ? "auto" : config.getMode().trim().toLowerCase();
+        if (!"auto".equals(mode) && !"text".equals(mode) && !"ocr".equals(mode)) {
+            throw new IllegalStateException("不支持的 healthos.ocr.mode=" + mode + "（可选 auto/text/ocr）");
         }
-        return count;
+        return mode;
+    }
+
+    private static List<Integer> pageNumbers(List<PageText> pages) {
+        return pages.stream().map(PageText::pageNumber).toList();
+    }
+
+    private static String joinText(List<String> pageTexts) {
+        StringBuilder markdown = new StringBuilder();
+        for (int i = 0; i < pageTexts.size(); i++) {
+            String text = pageTexts.get(i);
+            markdown.append(text == null ? "" : text.strip());
+            if (i < pageTexts.size() - 1) {
+                markdown.append('\n').append(PAGE_BREAK).append('\n');
+            }
+        }
+        return markdown.toString().strip();
     }
 }

@@ -359,12 +359,6 @@ public class HealthOsProperties {
     }
 
     /**
-     * OCR 参数。
-     *
-     * <p>为什么需要 {@code textLayerMinChars}：不少"扫描 PDF"里带一层隐藏的乱码文本层，
-     * 只判断"有无文本"会走进错误分支并抽出无意义内容。用字数下限做二次判定。
-     */
-    /**
      * 问答配置。{@code mode} 默认 {@code single}（保持原单路行为），
      * 改成 {@code parallel} 才会走三路并行 + 汇总。
      */
@@ -513,8 +507,25 @@ public class HealthOsProperties {
         private double minConfidence = 0.45;
         /** 单文档最多 OCR 页数，防止超大扫描件打满工作线程。 */
         private int maxPages = 200;
-        /** PDF 文本层有效字符数低于该值时判定为扫描件。 */
+
+        /**
+         * 文本层 / OCR 分流模式，对齐原工程 {@code patient_ocr_mode}：
+         * {@code auto}（逐页判定，仅对不达标页补 OCR）、{@code text}（只认文本层，不足即报错）、
+         * {@code ocr}（无条件整篇 OCR，用于强制重扫）。
+         */
+        private String mode = "auto";
+        /**
+         * <b>每页</b>文本层有效字符下限。整篇一次计数会让"前几页正文 + 后几页扫描图"
+         * 因总数达标而漏掉扫描页，因此判定必须逐页做；任一页不足即该页不可信。
+         * 80 取自原工程 {@code document_ocr.py} 的逐页阈值。
+         */
+        private int textLayerMinCharsPerPage = 80;
+        /** 整篇有效字符下限：防止"每页只有页码"的乱码文本层被当成正文。 */
         private int textLayerMinChars = 20;
+        /** 是否允许"字少且页面无图像"的书名页 / 空白分隔页留在文本路径。有图页永不豁免。 */
+        private boolean allowSparseTextPages = false;
+        /** OCR 输出有效字符下限，低于此值视为识别失败，不产出半截文档。 */
+        private int ocrMinResultChars = 30;
     }
 
     /**

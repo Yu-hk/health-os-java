@@ -39,6 +39,12 @@ public class OcrConfig {
     @Bean
     public OcrProvider ocrProvider(HealthOsProperties properties) {
         HealthOsProperties.Ocr config = properties.getOcr();
+        String mode = config.getMode() == null ? "auto" : config.getMode().trim().toLowerCase();
+        if (!"auto".equals(mode) && !"text".equals(mode) && !"ocr".equals(mode)) {
+            throw new IllegalStateException("不支持的 healthos.ocr.mode=" + mode
+                    + "（可选 auto/text/ocr）");
+        }
+        config.setMode(mode);
         String provider = config.getProvider() == null ? "none" : config.getProvider().toLowerCase();
         if ("none".equals(provider) || !StringUtils.hasText(provider)) {
             log.warn("OCR 未启用（healthos.ocr.provider=none）：扫描件与图片将明确失败，不做静默降级");
@@ -64,8 +70,9 @@ public class OcrConfig {
         config.setProtocol(protocol);
         config.setBaseUrl(normalizeBaseUrl(config.getBaseUrl()));
 
-        log.info("OCR 已启用 provider={} baseUrl={} dpi={} minConfidence={}",
-                provider, config.getBaseUrl(), config.getDpi(), config.getMinConfidence());
+        log.info("OCR 已启用 provider={} mode={} baseUrl={} dpi={} minConfidence={} perPageMinChars={}",
+                provider, mode, config.getBaseUrl(), config.getDpi(), config.getMinConfidence(),
+                config.getTextLayerMinCharsPerPage());
         return new HttpOcrProvider(config);
     }
 

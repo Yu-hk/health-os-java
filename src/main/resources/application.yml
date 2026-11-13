@@ -210,8 +210,17 @@ healthos:
     dpi: 200
     min-confidence: 0.45
     max-pages: 200
-    # PDF 文本层有效字符低于该值即判定为扫描件，转 OCR
+    # auto（逐页判定，只对不达标页补 OCR）/ text（只认文本层，不足即报错）/ ocr（强制整篇 OCR）
+    mode: ${HEALTHOS_OCR_MODE:auto}
+    # 判定逐页进行：任一页有效字符低于该值，该页就要补 OCR。
+    # 只做整篇计数会让"前几页正文 + 后几页扫描图"因总数达标而漏页。
+    text-layer-min-chars-per-page: 80
+    # 整篇下限，防止"每页只有页码"的乱码文本层被当成正文。
     text-layer-min-chars: 20
+    # true 时允许"字少且无图"的书名页/空白分隔页留在文本路径；有图的页永不豁免。
+    allow-sparse-text-pages: false
+    # OCR 输出有效字符下限，低于此值视为识别失败。
+    ocr-min-result-chars: 30
   graph:
     # jdbc（PostgreSQL 表）/ neo4j / dual（双写，读走 Neo4j 并回落）
     store: ${HEALTHOS_GRAPH_STORE:jdbc}

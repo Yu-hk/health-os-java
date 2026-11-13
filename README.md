@@ -153,9 +153,15 @@ MSYS2_ARG_CONV_EXCL='*' docker compose --profile ocr run --rm -v "$PWD/samples:/
   python3 /app/make_scanned_pdf.py /out/scanned-classic.pdf /out/scan-page.png
 ```
 
-判定逻辑不是「有没有文本」，而是「**有效字符数下限**」：
-PDFBox 抽到的文本去掉空白与分页符后少于 `text-layer-min-chars`（默认 20）才判为扫描件。
-很多扫描 PDF 带一层几乎无用的文本层（页码、水印），按「有无」判会漏掉整页正文。
+判定逻辑不是「有没有文本」，也不是「整篇数够不够」，而是**逐页**看文本层可信度：
+`effectiveChars` 只数汉字 / 字母 / 数字（页码、水印、标点、乱码控制符都不算），
+每页都要 ≥ `text-layer-min-chars-per-page`（默认 80），整篇还要 ≥ `text-layer-min-chars`（默认 20）。
+只做整篇计数会让「前几页正文 + 后几页扫描图」因总数达标而漏页；10 页扫描件每页「第 1 页」
+也能凑够 20 字。页面带图像 XObject 时，即使开了 `allow-sparse-text-pages` 也不豁免。
+
+`mode` 决定后续怎么走：`auto`（默认，只对不达标页补 OCR，清晰页保留无损 PDFBox 文本，
+结果标 `pdf-mixed`）、`text`（文本层不足直接报错，绝不偷偷降级）、`ocr`（无条件整篇重扫）。
+`pdf-mixed` 的 `engine` 记为 `pdfbox+<OCR名>`，`ocrPages` 是实际送 OCR 的页数。
 
 ### 2.2 RAGFlow 知识库（`healthos.retrieval.provider`）
 
@@ -221,10 +227,10 @@ POST /api/v1/retrieval                   page_size + similarity_threshold
 
 ## 3. 跑通了什么（实测结果，非声称）
 
-`mvn clean verify`：**541 个单元测试全部通过，BUILD SUCCESS**；分层依赖校验 0 违规（87 包 / 331 类 / 941 条跨包引用）。
+`mvn clean verify`：**549 个单元测试全部通过，BUILD SUCCESS**；分层依赖校验 0 违规（87 包 / 331 类 / 941 条跨包引用）。
 
 覆盖：分段 / 二分 / 合并 / 重试策略 / 证据定位 / 令牌 / 检索 / 指标判定 /
-OCR 行重建（6）/ OCR 响应解析（6）/ 扫描件判定与归一化（6）/ 规则抽取（9）/
+OCR 行重建（6）/ OCR 响应解析（6）/ 扫描件判定与归一化（14）/ 规则抽取（9）/
 问答分支编排（6）/ 图谱分支（4）/ 指标分支（3）/
 轨迹上下文与跨线程搬运（6）/ OTLP 导出（3）/ 轨迹写入与截断（9）/ 保留策略清理（3）/
 CSV 解析（5）/ 患者生命周期与乐观锁（12）/ 批次导入（4）/ 孤儿判定（4）/ 删除四段式（6）/
@@ -912,12 +918,13 @@ Markdown 的关键纪律：**只从已冻结来源取事实**——档案修订�
 
 ## 4. 系统流程图
 
-两张可交互图（双击打开，纯离线自包含 HTML，含聚焦、上下游可达、导出 PNG/SVG）：
+三张可交互图（双击打开，纯离线自包含 HTML，含聚焦、上下游可达、导出 PNG/SVG）：
 
 | 图 | 看什么 |
 |---|---|
 | [`docs/architecture/diagrams/system-architecture.html`](docs/architecture/diagrams/system-architecture.html) | 系统组成：使用者 → HTTP API → Outbox → 五节点流水线 / **资料录入编排 → 抽取器 SPI**；PostgreSQL / 对象存储；四个可选外部依赖落在哪一段 |
 | [`docs/architecture/diagrams/pipeline-workflow.html`](docs/architecture/diagrams/pipeline-workflow.html) | 流水线内部：内容分流（文本层 / 扫描件）、分段与检查点、RetryPolicy 三条异常分支、二分回退 |
+| [`docs/architecture/diagrams/report-intake-analysis.html`](docs/architecture/diagrams/report-intake-analysis.html) | **体检报告全链路**：上传受理 → Outbox 异步归一化/抽取 → 两道人工核查建档 → 健康评估报告与导出；下方卡片标注同步/异步边界与复核发现的已知问题 |
 
 阅读要点：
 
@@ -928,7 +935,9 @@ Markdown 的关键纪律：**只从已冻结来源取事实**——档案修订�
   两者共用 Outbox、对象存储与 PostgreSQL，但状态机与关卡互不干扰。
 - 流程图里「异常与重试」是一条单独泳道：**只有异常才会走到 `RetryPolicy`**，
   正常路径是 `extract → index → graph → manifest`，别把它读成串行必过。
-- 两张图由 `archify` 技能生成，源描述在 `.archify/<type>-<slug>-<时间戳>/candidate.json`，
+- 体检报告图里的 `QA / 记忆旁支` 按 `patientId` 独立触发，**不回读上传文件**；
+  问答检索的准入是典籍 `classic_document.status=READY`，体检侧只贡献指标事实。
+- 三张图由 `archify` 技能生成，源描述在 `.archify/<type>-<slug>-<时间戳>/candidate.json`，
   改图改这份 JSON 重跑即可；[`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md) 是同样内容的 Mermaid 文本版，
   便于在 diff 里看结构变化。
 
@@ -1087,9 +1096,12 @@ python tools/smoke/verify_auth_store.py   # 认证状态「重启不丢」：分
 配了 `provider` 却缺地址或密码 → **`IllegalStateException` 拒绝启动**，不做运行期猜。
 这样"配错了"在启动日志里就能看见，而不是等到第一个用户上传扫描件才炸。
 
-**⑦ 扫描件判定看「有效字符数」，OCR 行重建看坐标**
+**⑦ 扫描件判定看「逐页有效字符数 + 页面图像」，OCR 行重建看坐标**
 
-- 判定：文本层去空白后 `< textLayerMinChars` 才算扫描件（原因见 2.1）。
+- 判定：`effectiveChars` 只数汉字 / 字母 / 数字；`all(每页 ≥ textLayerMinCharsPerPage)`
+  且整篇 ≥ `textLayerMinChars` 才走纯文本层。整篇一次计数会漏掉混合 PDF 的扫描页。
+- 混合页：`auto` 只把不达标页渲染送 OCR，按原页码合并成 `pdf-mixed`；含图像的页
+  OCR 结果为空则整篇失败（原因见 2.1）。
 - 重建：`OcrTextAssembler` 按 `centerY` 聚类成段（`LINE_GAP_RATIO=0.7`、`MIN_GAP_PX=6`），
   段内按 `x1` 排序；中文相邻不加空格、含 ASCII 才补空格——否则会得到「四 君 子 汤」。
 - 单页 OCR 失败重试一次，仍失败则**整篇失败**：宁可让用户重传，也不交一份"看起来完整其实缺页"的正文。
@@ -1150,8 +1162,12 @@ RAGFlow 返回的切片没有页码与字符区间，`HybridKnowledgeBase.enrich
 | `HEALTHOS_OCR_BASE_URL` | 空 | 配了 `provider` 却留空 → 拒绝启动。**只给到主机和端口**（`http://127.0.0.1:8868`），带 `/predict/...` 之类路径 → 拒绝启动 |
 | `HEALTHOS_OCR_API_KEY` | 空 | 可选鉴权头 |
 | `HEALTHOS_OCR_LANGUAGE` | `chi_sim` | 传给 OCR 服务 |
+| `HEALTHOS_OCR_MODE` | `auto` | `auto`（逐页判定、只补不达标页）/ `text`（只认文本层，不足即报错）/ `ocr`（强制整篇重扫），非法值拒绝启动 |
 | `healthos.ocr.dpi` / `max-pages` / `min-confidence` | `200` / `200` / `0.45` | 渲染与过滤 |
-| `healthos.ocr.text-layer-min-chars` | `20` | 低于此值判为扫描件 |
+| `healthos.ocr.text-layer-min-chars-per-page` | `80` | 每页有效字符下限；任一页不足即该页需 OCR |
+| `healthos.ocr.text-layer-min-chars` | `20` | 整篇有效字符下限，防「每页只有页码」的乱码文本层 |
+| `healthos.ocr.allow-sparse-text-pages` | `false` | 允许字少且无图的书名页 / 空白分隔页留在文本路径；有图页永不豁免 |
+| `healthos.ocr.ocr-min-result-chars` | `30` | OCR 输出有效字符下限，低于此值视为识别失败 |
 
 **检索**
 
