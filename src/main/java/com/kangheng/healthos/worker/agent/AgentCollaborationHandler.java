@@ -6,18 +6,15 @@ import com.kangheng.healthos.service.agent.AgentCollaborationService;
 import com.kangheng.healthos.common.Json;
 import com.kangheng.healthos.spi.outbox.OutboxEventHandler;
 import com.kangheng.healthos.model.outbox.OutboxEventEntity;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 /**
  * 协同运行的执行器：只负责取 payload 里的 runId，执行逻辑都在服务里。
  */
+@Slf4j
 @Component
 public class AgentCollaborationHandler implements OutboxEventHandler {
-
-    private static final Logger log = LoggerFactory.getLogger(AgentCollaborationHandler.class);
 
     private final AgentCollaborationService collaborationService;
 
